@@ -11719,6 +11719,58 @@ class LatentNavigator(nn.Module if torch else object):
         except Exception:
             return {}
 
+    def draft_recurrence(self, io_pairs: List[Dict[str, Any]]) -> List['BSExpr']:
+        """
+        INVERSE SEMANTIC DRAFTING:
+        Finds relations in the *Output Space* and drafts ASTs directly.
+        Bypasses combinatorial search by solving y[i] = F(y[i-1], y[i-2]...)
+        """
+        drafts = []
+        if len(io_pairs) < 4: return drafts
+        
+        try:
+            # Sort by input n
+            sorted_pairs = sorted(io_pairs, key=lambda p: p['input'])
+            # Ensure consecutive inputs involved (1,2,3...) or at least ordered
+            outs = [p['output'] for p in sorted_pairs]
+            
+            # 1. Fibonacci-like Additive Recurrence: y[i] = y[i-1] + y[i-2]
+            # Check last 3 elements at least
+            is_fib = True
+            for i in range(2, len(outs)):
+                if abs(outs[i] - (outs[i-1] + outs[i-2])) > 0.001:
+                    is_fib = False
+                    break
+            
+            if is_fib:
+                print(f"    [Drafting] Detected Fibonacci relation (y[i]=y[i-1]+y[i-2]). Drafting AST...")
+                # Draft: Rec(n-1) + Rec(n-2)
+                # AST: (+ (Rec (- n 1)) (Rec (- n 2)))
+                n_var = BSVar('n')
+                n_minus_1 = BSBinOp('-', n_var, BSVal(1))
+                n_minus_2 = BSBinOp('-', n_var, BSVal(2))
+                rec_1 = BSRecCall(n_minus_1)
+                rec_2 = BSRecCall(n_minus_2)
+                draft = BSBinOp('+', rec_1, rec_2)
+                drafts.append(draft)
+
+            # 2. Linear Recurrence: y[i] = y[i-1] + C
+            deltas = [outs[i] - outs[i-1] for i in range(1, len(outs))]
+            if len(set(deltas)) == 1:
+                # Constant delta C
+                C = deltas[0]
+                if C != 0:
+                    # Draft: Rec(n-1) + C
+                    print(f"    [Drafting] Detected Linear relation (y[i]=y[i-1]+{C}). Drafting AST...")
+                    n_minus_1 = BSBinOp('-', BSVar('n'), BSVal(1))
+                    draft = BSBinOp('+', BSRecCall(n_minus_1), BSVal(int(C)))
+                    drafts.append(draft)
+
+        except Exception as e:
+            print(f"    [Drafting] Error: {e}")
+        
+        return drafts
+
     def learn(self, io_pairs: List[Dict[str, Any]], used_atoms: List[str]):
          if not self.active: return
          self.optim.zero_grad()
@@ -12173,6 +12225,14 @@ class BottomUpSynthesizer:
             # Beam Width Limit
             if len(next_bank) > self.max_candidates:
                 next_bank = next_bank[:self.max_candidates]
+
+            # INVERSE SEMANTIC DRAFTING (Data-Driven Code Generation)
+            # If Navigator is active, try to draft code directly from data relations
+            if self.navigator and depth == 0:  # Only draft once at the beginning
+                drafts = self.navigator.draft_recurrence(active_io)
+                if drafts:
+                    print(f"    [Synthesizer] Injecting {len(drafts)} semantic drafts into search...")
+                    next_bank.extend(drafts)
 
             # Guided selection using policy model
             if self.guided:
