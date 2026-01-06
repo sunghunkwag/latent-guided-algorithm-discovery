@@ -25,6 +25,8 @@ def verify_neural():
         cmd.extend(["--max-seconds", str(args.max_seconds)])
         if args.quick:
             cmd.append("--quick")
+        else:
+            cmd.append("--quick")
         if args.tasks:
             cmd.extend(["--tasks", args.tasks])
     else:
