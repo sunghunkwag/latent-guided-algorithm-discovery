@@ -9565,9 +9565,6 @@ class ResearchEnvironment:
 
         noise = self.rng.uniform(-0.02, 0.02)
         
-        # Custom hard-coded logic for recursion detection via Stagnation (simulated)
-        # If we are stagnant, we might be hitting a wall that needs recursion.
-        
         # Calculate base performance (still 0-1 normalized for consistency check)
         base_performance = max(0.0, min(1.0, base + raw + noise))
         infra_scale_bonus = self.env_params.get('infra_bonus_scale', 0.025)
@@ -11660,116 +11657,32 @@ class LatentNavigator(nn.Module if torch else object):
          
          priors = {k: v for k, v in zip(NAVIGATOR_ATOM_MAP, probs)}
          
-         # RESEARCH: General Heuristics (Growth Analysis)
-         # Detect non-linear growth patterns using discrete derivatives
-         growth_priors = self._analyze_growth(io_pairs)
-         if growth_priors:
-             # Blend: 50% Navigator, 30% Learned (if any), 20% Heuristic
-             # Or simpler: Boost existing priors with heuristic suggestions
-             print(f"    [Heuristic] Growth Analysis suggests: {growth_priors}")
-             for op, boost in growth_priors.items():
-                 if op in priors:
-                     priors[op] = max(priors[op], boost) # Take max to respect strong heuristic signals
-         
+         priors = self._adjust_priors(io_pairs, priors)
          return priors
 
-    def _analyze_growth(self, io_pairs: List[Dict[str, Any]]) -> Dict[str, float]:
+    def _adjust_priors(self, io_pairs: List[Dict[str, Any]], priors: Dict[str, float]) -> Dict[str, float]:
         """
-        Analyzes the growth rate of outputs to suggest operators.
-        Logic:
-        - Constant delta -> Linear -> '+', '-'
-        - Increasing delta (Acceleration) -> Non-linear -> 'Rec', '*'
-        - Rapid growth (Doubling+) -> Exponential -> 'Rec'
+        General hypothesis induction: adjust prior sharpness based on data stability.
+        This avoids operator-specific shortcuts and only calibrates the distribution.
         """
-        if len(io_pairs) < 3: return {}
-        
-        try:
-            #Sort by input to ensure sequence
-            sorted_pairs = sorted(io_pairs, key=lambda p: p['input'])
-            outputs = [float(p['output']) for p in sorted_pairs if isinstance(p['output'], (int, float))]
-            
-            if len(outputs) < 3: return {}
-            
-            # 1st Derivative (Velocity)
-            deltas = [outputs[i] - outputs[i-1] for i in range(1, len(outputs))]
-            
-            # 2nd Derivative (Acceleration)
-            accels = [deltas[i] - deltas[i-1] for i in range(1, len(deltas))]
-            
-            avg_accel = sum(accels) / len(accels)
-            
-            suggestions = {}
-            
-            # Pattern Recognition
-            if abs(avg_accel) < 0.001:
-                # Linear growth (Constant velocity)
-                suggestions['+'] = 0.6
-                suggestions['-'] = 0.4
-            elif avg_accel > 0:
-                # Accelerating growth -> Non-linear
-                suggestions['*'] = 0.5
-                suggestions['Rec'] = 0.5
-                
-                # Check for exponential/rapid growth (e.g., doubling)
-                is_rapid = all(outputs[i] >= 1.5 * outputs[i-1] for i in range(2, len(outputs)) if outputs[i-1] > 0)
-                if is_rapid:
-                    suggestions['Rec'] = 0.8 # Strong suggestion for recursion
-            
-            return suggestions
-        except Exception:
-            return {}
-
-    def draft_recurrence(self, io_pairs: List[Dict[str, Any]]) -> List['BSExpr']:
-        """
-        INVERSE SEMANTIC DRAFTING:
-        Finds relations in the *Output Space* and drafts ASTs directly.
-        Bypasses combinatorial search by solving y[i] = F(y[i-1], y[i-2]...)
-        """
-        drafts = []
-        if len(io_pairs) < 4: return drafts
-        
-        try:
-            # Sort by input n
-            sorted_pairs = sorted(io_pairs, key=lambda p: p['input'])
-            # Ensure consecutive inputs involved (1,2,3...) or at least ordered
-            outs = [p['output'] for p in sorted_pairs]
-            
-            # 1. Fibonacci-like Additive Recurrence: y[i] = y[i-1] + y[i-2]
-            # Check last 3 elements at least
-            is_fib = True
-            for i in range(2, len(outs)):
-                if abs(outs[i] - (outs[i-1] + outs[i-2])) > 0.001:
-                    is_fib = False
-                    break
-            
-            if is_fib:
-                print(f"    [Drafting] Detected Fibonacci relation (y[i]=y[i-1]+y[i-2]). Drafting AST...")
-                # Draft: Rec(n-1) + Rec(n-2)
-                # AST: (+ (Rec (- n 1)) (Rec (- n 2)))
-                n_var = BSVar('n')
-                n_minus_1 = BSBinOp('-', n_var, BSVal(1))
-                n_minus_2 = BSBinOp('-', n_var, BSVal(2))
-                rec_1 = BSRecCall(n_minus_1)
-                rec_2 = BSRecCall(n_minus_2)
-                draft = BSBinOp('+', rec_1, rec_2)
-                drafts.append(draft)
-
-            # 2. Linear Recurrence: y[i] = y[i-1] + C
-            deltas = [outs[i] - outs[i-1] for i in range(1, len(outs))]
-            if len(set(deltas)) == 1:
-                # Constant delta C
-                C = deltas[0]
-                if C != 0:
-                    # Draft: Rec(n-1) + C
-                    print(f"    [Drafting] Detected Linear relation (y[i]=y[i-1]+{C}). Drafting AST...")
-                    n_minus_1 = BSBinOp('-', BSVar('n'), BSVal(1))
-                    draft = BSBinOp('+', BSRecCall(n_minus_1), BSVal(int(C)))
-                    drafts.append(draft)
-
-        except Exception as e:
-            print(f"    [Drafting] Error: {e}")
-        
-        return drafts
+        if not priors:
+            return priors
+        outputs = [p["output"] for p in io_pairs if isinstance(p.get("output"), (int, float))]
+        if not outputs:
+            return priors
+        mean = sum(outputs) / len(outputs)
+        variance = sum((o - mean) ** 2 for o in outputs) / max(1, len(outputs))
+        std = math.sqrt(variance)
+        variability = std / (abs(mean) + 1.0)
+        sample_factor = min(1.0, len(outputs) / 6.0)
+        temperature = 1.0 + min(1.5, variability) * (1.0 - 0.5 * sample_factor)
+        adjusted = {k: max(v, 1e-6) ** (1.0 / temperature) for k, v in priors.items()}
+        total = sum(adjusted.values())
+        if total <= 0:
+            return priors
+        calibrated = {k: v / total for k, v in adjusted.items()}
+        print(f"    [Latent] Prior calibration: temp={temperature:.2f}, variability={variability:.2f}")
+        return calibrated
 
     def learn(self, io_pairs: List[Dict[str, Any]], used_atoms: List[str]):
          if not self.active: return
@@ -12246,14 +12159,6 @@ class BottomUpSynthesizer:
             # Beam Width Limit
             if len(next_bank) > self.max_candidates:
                 next_bank = next_bank[:self.max_candidates]
-
-            # INVERSE SEMANTIC DRAFTING (Data-Driven Code Generation)
-            # If Navigator is active, try to draft code directly from data relations
-            if self.navigator and depth == 0:  # Only draft once at the beginning
-                drafts = self.navigator.draft_recurrence(active_io)
-                if drafts:
-                    print(f"    [Synthesizer] Injecting {len(drafts)} semantic drafts into search...")
-                    next_bank.extend(drafts)
 
             # Guided selection using policy model
             if self.guided:
@@ -12881,6 +12786,10 @@ def orchestrator_main():
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
+
+    if "--selftest" in sys.argv:
+        run_full_system_selftest()
+        sys.exit(0)
 
     # Backward compatibility for --mode
     if len(sys.argv) > 2 and sys.argv[1] == "--mode" and sys.argv[2] == "hrm-life":
