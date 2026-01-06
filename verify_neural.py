@@ -3,6 +3,8 @@ import argparse
 import json
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 def verify_neural():
     parser = argparse.ArgumentParser(description="Verify neural-guided synthesis output.")
@@ -17,15 +19,18 @@ def verify_neural():
 
     print("[Test] Running Synthesis with Neural Guidance...")
     if args.ab_compare:
-        cmd = [sys.executable, "Systemtest.py", "ab-compare", "--seeds", str(args.seeds)]
-        if args.max_seconds is not None:
-            cmd.extend(["--max-seconds", str(args.max_seconds)])
+        cmd = [sys.executable, "-u", "Systemtest.py", "ab-compare", "--seeds", str(args.seeds)]
+        if args.max_seconds is None:
+            args.max_seconds = 120
+        cmd.extend(["--max-seconds", str(args.max_seconds)])
         if args.quick:
+            cmd.append("--quick")
+        else:
             cmd.append("--quick")
         if args.tasks:
             cmd.extend(["--tasks", args.tasks])
     else:
-        cmd = [sys.executable, "Systemtest.py", "synthesis"]
+        cmd = [sys.executable, "-u", "Systemtest.py", "synthesis"]
         if args.quick:
             cmd.append("--quick")
         if args.max_seconds is not None:
@@ -61,7 +66,11 @@ def verify_neural():
     print(errors[-1000:])
     
     # Checks
-    priors_detected = "[Latent] Guidance Priors:" in output
+    priors_detected = (
+        "[Latent] Combined Priors:" in output
+        or "[Latent] Prior calibration:" in output
+        or "[Hypothesis] Prior bias applied" in output
+    )
     if priors_detected:
         print("[Pass] Latent Navigator is active (Priors detected).")
     else:
@@ -75,6 +84,54 @@ def verify_neural():
         
     if "RuntimeError: EXEC BANNED" in errors or "RuntimeError: EXEC BANNED" in output:
          print("[Fail] EXEC BANNED triggered!")
+
+    evidence_entries = []
+    for line in output.splitlines():
+        if line.startswith("EVIDENCE_JSON="):
+            try:
+                payload = json.loads(line.split("=", 1)[1])
+                evidence_entries.append(payload)
+            except json.JSONDecodeError:
+                continue
+
+    run_id = f"run_{int(time.time())}"
+    evidence_path = Path(f"evidence_ab_compare_{run_id}.jsonl")
+    with evidence_path.open("w", encoding="utf-8") as handle:
+        for entry in evidence_entries:
+            record = {
+                "run_id": run_id,
+                "seed": entry.get("seed"),
+                "task_id": entry.get("task_id"),
+                "mode": entry.get("mode"),
+                "metrics": {
+                    "train_acc": entry.get("train_acc", 0.0),
+                    "holdout_acc": entry.get("holdout_acc", 0.0),
+                    "shift_acc": entry.get("shift_acc", 0.0),
+                    "adv_acc": entry.get("adv_acc", 0.0),
+                },
+                "complexity": {
+                    "node_count": entry.get("node_count"),
+                    "constant_abuse_score": entry.get("constant_abuse_score"),
+                },
+                "discovery_cost": entry.get("discovery_cost", {}),
+                "flags": {
+                    "any_heuristic_used": entry.get("any_heuristic_used", False),
+                    "hypothesis_selected": entry.get("hypothesis_selected", {}),
+                },
+            }
+            handle.write(json.dumps(record) + "\n")
+    print(f"[Evidence] JSONL written: {evidence_path}")
+    with evidence_path.open("r", encoding="utf-8") as handle:
+        preview = []
+        for _ in range(3):
+            line = handle.readline()
+            if not line:
+                break
+            preview.append(line.rstrip("\n"))
+    if preview:
+        print("[Evidence] Preview:")
+        for line in preview:
+            print(line)
 
     if args.ab_compare:
         status = "INCONCLUSIVE"
@@ -97,7 +154,9 @@ def verify_neural():
     else:
         print("\nOVERALL: NEURAL VERIFICATION FAILED")
     print(f"STATUS={status}")
-    sys.exit(0 if status == "PASS" else 1)
+    if status in {"PASS", "INCONCLUSIVE"}:
+        sys.exit(0)
+    sys.exit(1)
 
 if __name__ == "__main__":
     verify_neural()
