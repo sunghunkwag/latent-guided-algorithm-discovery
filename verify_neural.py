@@ -95,29 +95,55 @@ def verify_neural():
                 continue
 
     run_id = f"run_{int(time.time())}"
-    evidence_path = Path(f"evidence_ab_compare_{run_id}.jsonl")
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    evidence_path = logs_dir / f"evidence_ab_compare_{run_id}.jsonl"
+    fail_pairs = {}
+    if evidence_entries:
+        by_key = {}
+        for entry in evidence_entries:
+            key = (entry.get("seed"), entry.get("task_id"))
+            by_key.setdefault(key, {})[entry.get("mode")] = entry
+        for key, modes in by_key.items():
+            guided = modes.get("guided")
+            unguided = modes.get("unguided")
+            if not guided or not unguided:
+                continue
+            guided_train = guided.get("train_acc", 0.0)
+            unguided_train = unguided.get("train_acc", 0.0)
+            guided_holdout = guided.get("holdout_acc", 0.0)
+            unguided_holdout = unguided.get("holdout_acc", 0.0)
+            guided_shift = guided.get("shift_acc", 0.0)
+            unguided_shift = unguided.get("shift_acc", 0.0)
+            fail = (
+                guided_train > unguided_train
+                and guided_holdout <= unguided_holdout
+                and guided_shift <= unguided_shift
+            )
+            if fail:
+                fail_pairs[key] = True
+
     with evidence_path.open("w", encoding="utf-8") as handle:
         for entry in evidence_entries:
+            key = (entry.get("seed"), entry.get("task_id"))
+            run_status = "FAIL" if entry.get("mode") == "guided" and fail_pairs.get(key) else "PASS"
             record = {
                 "run_id": run_id,
                 "seed": entry.get("seed"),
                 "task_id": entry.get("task_id"),
                 "mode": entry.get("mode"),
-                "metrics": {
-                    "train_acc": entry.get("train_acc", 0.0),
-                    "holdout_acc": entry.get("holdout_acc", 0.0),
-                    "shift_acc": entry.get("shift_acc", 0.0),
-                    "adv_acc": entry.get("adv_acc", 0.0),
-                },
-                "complexity": {
-                    "node_count": entry.get("node_count"),
-                    "constant_abuse_score": entry.get("constant_abuse_score"),
-                },
-                "discovery_cost": entry.get("discovery_cost", {}),
-                "flags": {
-                    "any_heuristic_used": entry.get("any_heuristic_used", False),
-                    "hypothesis_selected": entry.get("hypothesis_selected", {}),
-                },
+                "train_acc": entry.get("train_acc", 0.0),
+                "holdout_acc": entry.get("holdout_acc", 0.0),
+                "shift_acc": entry.get("shift_acc", 0.0),
+                "complexity": entry.get("node_count"),
+                "hypothesis_selected": entry.get("hypothesis_type"),
+                "hypothesis_params": entry.get("hypothesis_params"),
+                "hypothesis_confidence": entry.get("hypothesis_confidence", 0.0),
+                "hypothesis_passed": entry.get("hypothesis_passed", False),
+                "elapsed_seconds": entry.get("elapsed_seconds"),
+                "max_seconds": entry.get("max_seconds"),
+                "quick": entry.get("quick"),
+                "run_status": run_status,
             }
             handle.write(json.dumps(record) + "\n")
     print(f"[Evidence] JSONL written: {evidence_path}")
@@ -132,6 +158,10 @@ def verify_neural():
         print("[Evidence] Preview:")
         for line in preview:
             print(line)
+    if fail_pairs:
+        print("[Fail] Guided improved train but not holdout/shift for some runs.")
+        for (seed, task_id) in sorted(fail_pairs):
+            print(f"  - seed={seed} task={task_id}")
 
     if args.ab_compare:
         status = "INCONCLUSIVE"

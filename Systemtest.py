@@ -11747,7 +11747,7 @@ class HypothesisInducer:
             candidates.append(rec)
         if not candidates:
             return None
-        candidates.sort(key=lambda r: (-(r.train_acc + r.holdout_acc), -r.shift_acc))
+        candidates.sort(key=lambda r: r.confidence, reverse=True)
         best = candidates[0]
         print(
             f"    [Hypothesis] Selected={best.hypothesis_type} "
@@ -11762,25 +11762,20 @@ class HypothesisInducer:
         shift: List[Dict[str, Any]],
     ) -> Optional[HypothesisResult]:
         best = None
-        best_err = float("inf")
+        best_confidence = -1.0
         for p0 in range(self.coeff_range[0], self.coeff_range[1] + 1):
             for p1 in range(self.coeff_range[0], self.coeff_range[1] + 1):
                 for p2 in range(self.coeff_range[0], self.coeff_range[1] + 1):
-                    err = 0.0
-                    for pair in train:
-                        n = pair["input"]
-                        pred = p0 + p1 * n + p2 * n * n
-                        err += abs(pred - pair["output"])
-                    if err < best_err:
-                        best_err = err
-                        best = (p0, p1, p2)
+                    train_acc = self._accuracy(train, lambda n: p0 + p1 * n + p2 * n * n)
+                    holdout_acc = self._accuracy(holdout, lambda n: p0 + p1 * n + p2 * n * n)
+                    shift_acc = self._accuracy(shift, lambda n: p0 + p1 * n + p2 * n * n)
+                    confidence = 0.2 * train_acc + 0.4 * holdout_acc + 0.4 * shift_acc
+                    if confidence > best_confidence:
+                        best_confidence = confidence
+                        best = (p0, p1, p2, train_acc, holdout_acc, shift_acc, confidence)
         if best is None:
             return None
-        p0, p1, p2 = best
-        train_acc = self._accuracy(train, lambda n: p0 + p1 * n + p2 * n * n)
-        holdout_acc = self._accuracy(holdout, lambda n: p0 + p1 * n + p2 * n * n)
-        shift_acc = self._accuracy(shift, lambda n: p0 + p1 * n + p2 * n * n)
-        confidence = 0.2 * train_acc + 0.4 * holdout_acc + 0.4 * shift_acc
+        p0, p1, p2, train_acc, holdout_acc, shift_acc, confidence = best
         passed = holdout_acc >= 0.6 and shift_acc >= 0.6
         priors = {"+": 1.25, "*": 1.15, "Const": 1.1, "Arg": 1.05}
         temperature = 0.9 if passed else 1.0
@@ -12665,6 +12660,28 @@ def run_synthesis_verification_suite(
             if deadline and time.time() > deadline:
                 print("   [TIMEOUT] Max seconds reached before task start.")
                 timeout = True
+                timeout_result = {
+                    "task_id": name,
+                    "mode": "guided" if guided else "unguided",
+                    "seed": seed,
+                    "train_acc": 0.0,
+                    "holdout_acc": 0.0,
+                    "shift_acc": 0.0,
+                    "adv_acc": 0.0,
+                    "node_count": None,
+                    "constant_abuse_score": None,
+                    "elapsed_seconds": round(time.time() - start_time, 4),
+                    "max_seconds": max_seconds,
+                    "quick": quick,
+                    "steps": setup.synthesizer.step_count,
+                    "any_heuristic_used": False,
+                    "hypothesis_type": None,
+                    "hypothesis_params": None,
+                    "hypothesis_confidence": 0.0,
+                    "hypothesis_passed": False,
+                }
+                per_task_results.append(timeout_result)
+                print(f"EVIDENCE_JSON={json.dumps(timeout_result, separators=(',', ':'))}")
                 break
 
             print(f"\n>> TASK: {name}")
@@ -12715,6 +12732,28 @@ def run_synthesis_verification_suite(
             except TimeoutError as e:
                 print(f"   [TIMEOUT] {e}")
                 timeout = True
+                timeout_result = {
+                    "task_id": name,
+                    "mode": "guided" if guided else "unguided",
+                    "seed": seed,
+                    "train_acc": 0.0,
+                    "holdout_acc": 0.0,
+                    "shift_acc": 0.0,
+                    "adv_acc": 0.0,
+                    "node_count": None,
+                    "constant_abuse_score": None,
+                    "elapsed_seconds": round(time.time() - start_time, 4),
+                    "max_seconds": max_seconds,
+                    "quick": quick,
+                    "steps": setup.synthesizer.step_count,
+                    "any_heuristic_used": bool(hypothesis and hypothesis.passed),
+                    "hypothesis_type": hypothesis.hypothesis_type if hypothesis else None,
+                    "hypothesis_params": hypothesis.params if hypothesis else None,
+                    "hypothesis_confidence": round(hypothesis.confidence, 3) if hypothesis else 0.0,
+                    "hypothesis_passed": bool(hypothesis and hypothesis.passed),
+                }
+                per_task_results.append(timeout_result)
+                print(f"EVIDENCE_JSON={json.dumps(timeout_result, separators=(',', ':'))}")
                 break
             elapsed = time.time() - start_t
             step_delta = setup.synthesizer.step_count - step_start
@@ -12731,13 +12770,15 @@ def run_synthesis_verification_suite(
                     "adv_acc": 0.0,
                     "node_count": None,
                     "constant_abuse_score": None,
-                    "discovery_cost": {"elapsed_seconds": round(elapsed, 4), "steps": step_delta},
+                    "elapsed_seconds": round(elapsed, 4),
+                    "max_seconds": max_seconds,
+                    "quick": quick,
+                    "steps": step_delta,
                     "any_heuristic_used": bool(hypothesis and hypothesis.passed),
-                    "hypothesis_selected": {
-                        "type": hypothesis.hypothesis_type if hypothesis else None,
-                        "confidence": round(hypothesis.confidence, 3) if hypothesis else 0.0,
-                        "passed": bool(hypothesis and hypothesis.passed),
-                    },
+                    "hypothesis_type": hypothesis.hypothesis_type if hypothesis else None,
+                    "hypothesis_params": hypothesis.params if hypothesis else None,
+                    "hypothesis_confidence": round(hypothesis.confidence, 3) if hypothesis else 0.0,
+                    "hypothesis_passed": bool(hypothesis and hypothesis.passed),
                 }
                 per_task_results.append(failure_result)
                 print(f"EVIDENCE_JSON={json.dumps(failure_result, separators=(',', ':'))}")
@@ -12798,13 +12839,15 @@ def run_synthesis_verification_suite(
                 "adv_acc": adv_passed / max(1, adv_total),
                 "node_count": node_count,
                 "constant_abuse_score": round(constant_abuse_score, 4),
-                "discovery_cost": {"elapsed_seconds": round(elapsed, 4), "steps": step_delta},
+                "elapsed_seconds": round(elapsed, 4),
+                "max_seconds": max_seconds,
+                "quick": quick,
+                "steps": step_delta,
                 "any_heuristic_used": bool(hypothesis and hypothesis.passed),
-                "hypothesis_selected": {
-                    "type": hypothesis.hypothesis_type if hypothesis else None,
-                    "confidence": round(hypothesis.confidence, 3) if hypothesis else 0.0,
-                    "passed": bool(hypothesis and hypothesis.passed),
-                },
+                "hypothesis_type": hypothesis.hypothesis_type if hypothesis else None,
+                "hypothesis_params": hypothesis.params if hypothesis else None,
+                "hypothesis_confidence": round(hypothesis.confidence, 3) if hypothesis else 0.0,
+                "hypothesis_passed": bool(hypothesis and hypothesis.passed),
             }
             per_task_results.append(task_result)
             print(f"EVIDENCE_JSON={json.dumps(task_result, separators=(',', ':'))}")
