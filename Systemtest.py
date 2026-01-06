@@ -11652,10 +11652,13 @@ class SafeInterpreter:
         return 0
 
 class BottomUpSynthesizer:
-    def __init__(self, max_depth=4):
+    def __init__(self, max_depth=6, max_candidates=50000, bank_cap=600):
         self.max_depth = max_depth
+        self.max_candidates = max_candidates
+        self.bank_cap = bank_cap
         self.interpreter = SafeInterpreter(limit=2000)
         self.navigator = LatentNavigator()
+        self.latent_priors_detected = False
 
     def _score_expr(self, expr: BSExpr, priors: Dict[str, float]) -> float:
         if not priors: return 1.0
@@ -11688,8 +11691,10 @@ class BottomUpSynthesizer:
             atoms.append("Const")
         return atoms
         
-    def synthesize(self, io_pairs: List[Dict[str, Any]]) -> List[str]:
+    def synthesize(self, io_pairs: List[Dict[str, Any]], deadline: Optional[float] = None) -> List[str]:
         # Form: def f(n): if n <= BASE_K: return BASE_V else: return {EXPR}
+        if deadline and time.time() > deadline:
+            raise TimeoutError("Synthesis timeout")
         
         base_k = 1
         base_v = 1
@@ -11706,6 +11711,7 @@ class BottomUpSynthesizer:
         # Latent Space Guidance
         priors = self.navigator.get_priors(active_io) if self.navigator else {}
         if priors:
+            self.latent_priors_detected = True
             print(f"    [Latent] Guidance Priors: { {k: round(v,3) for k,v in priors.items()} }")
 
         print(f"    [Synthesizer] Growing atoms for {len(active_io)} inputs (Base: n<={base_k}->{base_v})...")
@@ -11726,7 +11732,9 @@ class BottomUpSynthesizer:
                  except: valid = False; break
             if valid: bank_behaviors[tuple(sig)] = expr
         
-        for depth in range(6):
+        for depth in range(self.max_depth):
+            if deadline and time.time() > deadline:
+                raise TimeoutError("Synthesis timeout")
             if not bank: break
             next_bank = []
             
@@ -11745,8 +11753,8 @@ class BottomUpSynthesizer:
                 next_bank.sort(key=lambda e: self._score_expr(e, priors), reverse=True)
             
             # Beam Width Limit
-            if len(next_bank) > 50000:
-                next_bank = next_bank[:50000]
+            if len(next_bank) > self.max_candidates:
+                next_bank = next_bank[:self.max_candidates]
                 
             # Update bank
             new_additions = 0
@@ -11754,7 +11762,9 @@ class BottomUpSynthesizer:
             candidate_count = len(next_bank)
             unique_behaviors = {}
             
-            for expr in next_bank:
+            for idx, expr in enumerate(next_bank):
+                if deadline and idx % 1000 == 0 and time.time() > deadline:
+                    raise TimeoutError("Synthesis timeout")
                 sig = []
                 valid = True
                 
@@ -11821,9 +11831,9 @@ class BottomUpSynthesizer:
             print(f"      [Depth {depth}] Candidates: {candidate_count} | Pruned: {pruned_count} | New Behaviors: {new_additions} | Total Bank: {len(bank)}")
             if new_additions == 0: break
             
-            if len(bank) > 600:
+            if len(bank) > self.bank_cap:
                  bank.sort(key=lambda x: len(str(x)))
-                 bank = bank[:600]
+                 bank = bank[:self.bank_cap]
                  
         return []
 
@@ -11833,22 +11843,30 @@ class BottomUpSynthesizer:
 
 
 class HRMSidecar:
-    def __init__(self, tools_registry: ToolRegistry):
+    def __init__(self, tools_registry: ToolRegistry, quick: bool = False):
         self.tools = tools_registry
         self.stitch = StitchLite()
         self.py2lam = PyToLambda()
         self.lam2py = LambdaToPy()
-        self.synthesizer = BottomUpSynthesizer()
+        if quick:
+            self.synthesizer = BottomUpSynthesizer(max_depth=3, max_candidates=20000, bank_cap=300)
+        else:
+            self.synthesizer = BottomUpSynthesizer()
         self.concept_count = 0
 
-    def dream(self, experiences_as_code: List[str], io_examples: List[Dict[str, Any]] = None) -> List[Tuple[str, Any]]:
+    def dream(
+        self,
+        experiences_as_code: List[str],
+        io_examples: List[Dict[str, Any]] = None,
+        deadline: Optional[float] = None,
+    ) -> List[Tuple[str, Any]]:
         print(f"[HRM-Sidecar] Dreaming on {len(experiences_as_code)} experiences...")
         
         # 1. Search-based Synthesis (High Priority)
         # If we have I/O examples, we can try to find a perfect recursive match
         if io_examples:
             print(f"  > Attempting Bottom-Up Synthesis (Truthful) on {len(io_examples)} examples...")
-            syn_results = self.synthesizer.synthesize(io_examples)
+            syn_results = self.synthesizer.synthesize(io_examples, deadline=deadline)
             if syn_results:
                 # syn_results is [(code, ast, k, v)]
                 # Verification suite expects this signature
@@ -11932,79 +11950,128 @@ def _smoke_test_sidecar():
     run_synthesis_verification_suite()
     print("=== RECURSION TEST COMPLETE ===")
 
-def run_synthesis_verification_suite():
+def run_synthesis_verification_suite(
+    quick: bool = False,
+    max_seconds: Optional[float] = None,
+    tasks: Optional[Iterable[str]] = None,
+):
     print("\n" + "="*60)
     print("   HONEST ALGORITHM DISCOVERY VERIFICATION SUITE")
     print("   Mode: Bottom-Up Enumeration + Safe Interpretation (NO EXEC)")
     print("="*60)
     
+    start_time = time.time()
+    timeout = False
+    tasks_attempted = 0
+    tasks_succeeded = 0
+
     # 1. Setup Tasks (Truth-Ground)
     def fib(n): return n if n<=1 else fib(n-1)+fib(n-2)
     def tri(n): return 0 if n<=0 else n + tri(n-1)
     def fact(n): return 1 if n<=0 else n * fact(n-1)
-    
-    tasks = [
+
+    all_tasks = [
         ("Fibonacci", fib, 11),  # 0..10
         ("Triangular", tri, 11),
         ("Factorial", fact, 8)
     ]
-    
-    setup = HRMSidecar(ToolRegistry())
-    
-    for name, func, count in tasks:
-        print(f"\n>> TASK: {name}")
-        
-        # 2. Split Data
-        xs = list(range(count))
-        data = [{'input': x, 'output': func(x)} for x in xs]
-        train_data = data[:6] # 0..5
-        holdout_data = data[6:] # 6..10
-        
-        print(f"   Train Set ({len(train_data)}): {[d['input'] for d in train_data]} -> {[d['output'] for d in train_data]}")
-        print(f"   Holdout Set ({len(holdout_data)}): {[d['input'] for d in holdout_data]}")
-        
-        # 3. Synthesize (Train only)
-        start_t = time.time()
-        results = setup.dream([], io_examples=train_data)
-        elapsed = time.time() - start_t
-        
-        if not results:
-            print(f"   [FAIL] No concept synthesized for {name}.")
-            continue
-            
-        # Unpack result: [(code_str, (ast_obj, k, v))]
-        code_str, meta = results[0]
-        ast_obj, k_val, v_val = meta
-        
-        print(f"   [Synthesized Code]:")
-        for line in code_str.splitlines():
-            print(f"      {line}")
-        print(f"   Time: {elapsed:.4f}s")
 
-        # 4. Verify on Holdout (Strict Safe Interpreter)
-        print(f"   [Verification] Running SafeInterpreter on Holdout...")
-        try:
-            passed = 0
-            for h in holdout_data:
-                inp = h['input']
-                expected = h['output']
-                try:
-                    # TRUE SAFE EXECUTION: interpreter.run_recursive
-                    res = setup.synthesizer.interpreter.run_recursive(ast_obj, inp, k_val, v_val)
-                    if res == expected:
-                        passed += 1
-                    else:
-                        print(f"      [Mismatch] In: {inp}, Expected: {expected}, Got: {res}")
-                except RuntimeError as e:
-                     print(f"      [RuntimeError] {e} on input {inp}")
-            
-            if passed == len(holdout_data):
-                print(f"   [PASS] Verified on all {len(holdout_data)} holdout examples.")
+    task_filter = None
+    if tasks:
+        task_filter = {t.strip().lower() for t in tasks if t.strip()}
+
+    filtered_tasks = []
+    for name, func, count in all_tasks:
+        if task_filter and name.lower() not in task_filter:
+            continue
+        filtered_tasks.append((name, func, count))
+
+    setup = HRMSidecar(ToolRegistry(), quick=quick)
+    deadline = start_time + max_seconds if max_seconds else None
+
+    try:
+        for name, func, count in filtered_tasks:
+            if deadline and time.time() > deadline:
+                print("   [TIMEOUT] Max seconds reached before task start.")
+                timeout = True
+                break
+
+            print(f"\n>> TASK: {name}")
+            tasks_attempted += 1
+
+            # 2. Split Data
+            if quick:
+                count = min(count, 7)
+                train_size = min(4, count)
             else:
-                print(f"   [FAIL] Passed {passed}/{len(holdout_data)} holdout examples.")
-                
-        except Exception as e:
-            print(f"   [CRASH] Verification error: {e}")
+                train_size = 6
+            xs = list(range(count))
+            data = [{'input': x, 'output': func(x)} for x in xs]
+            train_data = data[:train_size]
+            holdout_data = data[train_size:]
+
+            print(f"   Train Set ({len(train_data)}): {[d['input'] for d in train_data]} -> {[d['output'] for d in train_data]}")
+            print(f"   Holdout Set ({len(holdout_data)}): {[d['input'] for d in holdout_data]}")
+
+            # 3. Synthesize (Train only)
+            start_t = time.time()
+            try:
+                results = setup.dream([], io_examples=train_data, deadline=deadline)
+            except TimeoutError as e:
+                print(f"   [TIMEOUT] {e}")
+                timeout = True
+                break
+            elapsed = time.time() - start_t
+
+            if not results:
+                print(f"   [FAIL] No concept synthesized for {name}.")
+                continue
+
+            # Unpack result: [(code_str, (ast_obj, k, v))]
+            code_str, meta = results[0]
+            ast_obj, k_val, v_val = meta
+
+            print(f"   [Synthesized Code]:")
+            for line in code_str.splitlines():
+                print(f"      {line}")
+            print(f"   Time: {elapsed:.4f}s")
+
+            # 4. Verify on Holdout (Strict Safe Interpreter)
+            print(f"   [Verification] Running SafeInterpreter on Holdout...")
+            try:
+                passed = 0
+                for h in holdout_data:
+                    inp = h['input']
+                    expected = h['output']
+                    try:
+                        # TRUE SAFE EXECUTION: interpreter.run_recursive
+                        res = setup.synthesizer.interpreter.run_recursive(ast_obj, inp, k_val, v_val)
+                        if res == expected:
+                            passed += 1
+                        else:
+                            print(f"      [Mismatch] In: {inp}, Expected: {expected}, Got: {res}")
+                    except RuntimeError as e:
+                         print(f"      [RuntimeError] {e} on input {inp}")
+
+                if passed == len(holdout_data):
+                    print(f"   [PASS] Verified on all {len(holdout_data)} holdout examples.")
+                    tasks_succeeded += 1
+                else:
+                    print(f"   [FAIL] Passed {passed}/{len(holdout_data)} holdout examples.")
+
+            except Exception as e:
+                print(f"   [CRASH] Verification error: {e}")
+    finally:
+        elapsed_seconds = time.time() - start_time
+        latent_priors_detected = setup.synthesizer.latent_priors_detected
+        summary = {
+            "timeout": timeout,
+            "latent_priors_detected": latent_priors_detected,
+            "tasks_attempted": tasks_attempted,
+            "tasks_succeeded": tasks_succeeded,
+            "elapsed_seconds": round(elapsed_seconds, 3),
+        }
+        print(f"SUMMARY_JSON={json.dumps(summary, separators=(',', ':'))}")
 
 
 def orchestrator_benchmark_main(args):
@@ -12123,6 +12190,12 @@ if __name__ == "__main__":
 
     # 3. HRM Life (Infinite Loop)
     hrm_parser = subparsers.add_parser("hrm-life", help="Run infinite HRM life loop")
+
+    # 4. Synthesis Verification Suite (Deterministic)
+    synth_parser = subparsers.add_parser("synthesis", help="Run synthesis verification suite")
+    synth_parser.add_argument("--quick", action="store_true", help="Reduce search effort for fast smoke runs")
+    synth_parser.add_argument("--max-seconds", type=float, default=None, help="Hard cap runtime in seconds")
+    synth_parser.add_argument("--tasks", type=str, default=None, help="Comma-separated list of tasks to run")
     
     # If no args, default to benchmark (but maybe simpler to smoke test for now? User asked for benchmark default)
     # However, if I run with no args, argparse helps? No, I need manually check.
@@ -12139,5 +12212,14 @@ if __name__ == "__main__":
         orchestrator_main()
     elif args.command == "hrm-life":
         run_hrm_life()
+    elif args.command == "synthesis":
+        task_list = None
+        if args.tasks:
+            task_list = [t.strip() for t in args.tasks.split(",") if t.strip()]
+        run_synthesis_verification_suite(
+            quick=args.quick,
+            max_seconds=args.max_seconds,
+            tasks=task_list,
+        )
     else:
         parser.print_help()
