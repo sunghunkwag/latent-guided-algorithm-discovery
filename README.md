@@ -10,6 +10,7 @@ This codebase is not a trained deep learning model, and it does not claim benchm
 ```bash
 python verify_neural.py --quick --max-seconds 45
 python -c "import Systemtest; Systemtest.run_synthesis_verification_suite()"
+python verify_neural.py --ab-compare --seeds 5 --max-seconds 600
 ```
 
 ## Interpreting PASS / FAIL / INCONCLUSIVE
