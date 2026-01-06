@@ -12600,23 +12600,32 @@ def orchestrator_main():
                  print(f"STAGNATION DETECTED: round={i}, window={stagnation_window}")
                  is_stagnant = True
             
-            # HRM Sidecar Call
+            # HRM Sidecar Call - Use REAL synthesis with I/O examples
             if is_stagnant:
-                # Capture REAL code experiences from memory (look for code_snippet kind)
-                experiences = []
-                code_mems = orch.mem.search("code_snippet", k=10, kinds=["code_snippet"])
-                for mem in code_mems:
-                    if hasattr(mem, 'content') and isinstance(mem.content, dict):
-                        code = mem.content.get("code", "")
-                        if code and "return" in code:
-                            experiences.append(code)
+                # Generate I/O examples for algorithm discovery (e.g., Fibonacci)
+                def fib(n): return n if n <= 1 else fib(n-1) + fib(n-2)
+                io_examples = [{'input': x, 'output': fib(x)} for x in range(7)]
                 
-                if experiences:
-                    print(f"[HRM-Sidecar] Found {len(experiences)} code snippets for analysis")
-                    concepts = hrm_sidecar.dream(experiences)
+                print(f"[HRM-Sidecar] Attempting REAL synthesis on Fibonacci I/O examples...")
+                concepts = hrm_sidecar.dream(
+                    experiences_as_code=[],
+                    io_examples=io_examples,
+                    deadline=time.time() + 30,  # 30 second timeout
+                    task_id="fibonacci_discovery",
+                )
+                if concepts:
+                    print(f"[HRM-Sidecar] Discovered {len(concepts)} concepts!")
                     hrm_sidecar.inject(concepts)
+                    # Store discovered code in memory
+                    for code, meta in concepts:
+                        orch.mem.add(
+                            "code_snippet",
+                            f"discovered_concept_{i}",
+                            {"code": code, "origin": "real_synthesis"},
+                            tags=["code_snippet", "discovered", "success"],
+                        )
                 else:
-                    print(f"[HRM-Sidecar] No code snippets found in memory")
+                    print(f"[HRM-Sidecar] No concepts discovered (synthesis failed)")
 
             out = orch.run_recursive_cycle(
                 round_idx=i, 
@@ -12624,28 +12633,8 @@ def orchestrator_main():
                 force_meta_proposal=force_meta
             )
             
-            # Store code snippets for HRM-Sidecar analysis
-            # Generate sample algorithmic patterns based on round results
-            results = out.get("results", [])
-            if results:
-                mean_reward = sum(r["reward"] for r in results) / len(results)
-                # Generate code patterns based on reward
-                if mean_reward > 1.0:
-                    orch.mem.add(
-                        "code_snippet",
-                        f"pattern_round_{i}",
-                        {"code": f"def f(n): return n + {int(mean_reward)}", "reward": mean_reward},
-                        tags=["code_snippet", "success"],
-                    )
-                if mean_reward > 1.5:
-                    orch.mem.add(
-                        "code_snippet", 
-                        f"recursive_pattern_{i}",
-                        {"code": f"def f(n): return 1 if n <= 0 else n + f(n-1)", "reward": mean_reward},
-                        tags=["code_snippet", "recursive", "success"],
-                    )
-            
             # Print minimal summary
+            results = out.get("results", [])
             mean_reward = sum(r["reward"] for r in results) / max(1, len(results)) if results else 0.0
             print(f"  > Rewards: mean={mean_reward:.4f}")
             print(f"  > Policy: risk={orch._org_policy.get('risk', 0.0):.2f}, roles={len(orch._agents)}")
