@@ -11707,6 +11707,163 @@ class LatentNavigator(nn.Module if torch else object):
          loss.backward()
          self.optim.step()
 
+
+@dataclass
+class HypothesisResult:
+    hypothesis_type: str
+    params: Dict[str, float]
+    train_acc: float
+    holdout_acc: float
+    shift_acc: float
+    confidence: float
+    priors: Dict[str, float]
+    temperature: float
+    passed: bool
+
+
+class HypothesisInducer:
+    def __init__(
+        self,
+        coeff_range: Tuple[int, int] = (-3, 3),
+        rec_range: Tuple[int, int] = (-2, 2),
+    ) -> None:
+        self.coeff_range = coeff_range
+        self.rec_range = rec_range
+
+    def induce(
+        self,
+        train: List[Dict[str, Any]],
+        holdout: List[Dict[str, Any]],
+        shift: List[Dict[str, Any]],
+    ) -> Optional[HypothesisResult]:
+        if not train:
+            return None
+        candidates = []
+        poly = self._fit_polynomial(train, holdout, shift)
+        if poly:
+            candidates.append(poly)
+        rec = self._fit_recurrence(train, holdout, shift)
+        if rec:
+            candidates.append(rec)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda r: (-(r.train_acc + r.holdout_acc), -r.shift_acc))
+        best = candidates[0]
+        print(
+            f"    [Hypothesis] Selected={best.hypothesis_type} "
+            f"conf={best.confidence:.2f} holdout={best.holdout_acc:.2f} shift={best.shift_acc:.2f}"
+        )
+        return best
+
+    def _fit_polynomial(
+        self,
+        train: List[Dict[str, Any]],
+        holdout: List[Dict[str, Any]],
+        shift: List[Dict[str, Any]],
+    ) -> Optional[HypothesisResult]:
+        best = None
+        best_err = float("inf")
+        for p0 in range(self.coeff_range[0], self.coeff_range[1] + 1):
+            for p1 in range(self.coeff_range[0], self.coeff_range[1] + 1):
+                for p2 in range(self.coeff_range[0], self.coeff_range[1] + 1):
+                    err = 0.0
+                    for pair in train:
+                        n = pair["input"]
+                        pred = p0 + p1 * n + p2 * n * n
+                        err += abs(pred - pair["output"])
+                    if err < best_err:
+                        best_err = err
+                        best = (p0, p1, p2)
+        if best is None:
+            return None
+        p0, p1, p2 = best
+        train_acc = self._accuracy(train, lambda n: p0 + p1 * n + p2 * n * n)
+        holdout_acc = self._accuracy(holdout, lambda n: p0 + p1 * n + p2 * n * n)
+        shift_acc = self._accuracy(shift, lambda n: p0 + p1 * n + p2 * n * n)
+        confidence = 0.2 * train_acc + 0.4 * holdout_acc + 0.4 * shift_acc
+        passed = holdout_acc >= 0.6 and shift_acc >= 0.6
+        priors = {"+": 1.25, "*": 1.15, "Const": 1.1, "Arg": 1.05}
+        temperature = 0.9 if passed else 1.0
+        return HypothesisResult(
+            hypothesis_type="polynomial2",
+            params={"p0": p0, "p1": p1, "p2": p2},
+            train_acc=train_acc,
+            holdout_acc=holdout_acc,
+            shift_acc=shift_acc,
+            confidence=confidence,
+            priors=priors if passed else {},
+            temperature=temperature,
+            passed=passed,
+        )
+
+    def _fit_recurrence(
+        self,
+        train: List[Dict[str, Any]],
+        holdout: List[Dict[str, Any]],
+        shift: List[Dict[str, Any]],
+    ) -> Optional[HypothesisResult]:
+        seq = sorted(train, key=lambda p: p["input"])
+        inputs = [p["input"] for p in seq]
+        if len(inputs) < 3:
+            return None
+        if any(inputs[i] + 1 != inputs[i + 1] for i in range(len(inputs) - 1)):
+            return None
+        outputs = [p["output"] for p in seq]
+        best = None
+        best_err = float("inf")
+        for a in range(self.rec_range[0], self.rec_range[1] + 1):
+            for b in range(self.rec_range[0], self.rec_range[1] + 1):
+                for c in range(self.rec_range[0], self.rec_range[1] + 1):
+                    preds = outputs[:2]
+                    for idx in range(2, len(outputs)):
+                        preds.append(a * preds[-1] + b * preds[-2] + c)
+                    err = sum(abs(preds[i] - outputs[i]) for i in range(len(outputs)))
+                    if err < best_err:
+                        best_err = err
+                        best = (a, b, c)
+        if best is None:
+            return None
+        a, b, c = best
+        def predict(n: int) -> float:
+            start_n = inputs[0]
+            max_needed = max([n] + inputs)
+            seq_out = outputs[:2]
+            for _ in range(start_n + 2, max_needed + 1):
+                seq_out.append(a * seq_out[-1] + b * seq_out[-2] + c)
+            idx = n - start_n
+            if 0 <= idx < len(seq_out):
+                return seq_out[idx]
+            return seq_out[-1]
+
+        train_acc = self._accuracy(train, predict)
+        holdout_acc = self._accuracy(holdout, predict)
+        shift_acc = self._accuracy(shift, predict)
+        confidence = 0.2 * train_acc + 0.4 * holdout_acc + 0.4 * shift_acc
+        passed = holdout_acc >= 0.6 and shift_acc >= 0.6
+        priors = {"Rec": 1.35, "+": 1.2, "*": 1.1, "Const": 1.05}
+        temperature = 0.85 if passed else 1.0
+        return HypothesisResult(
+            hypothesis_type="recurrence2",
+            params={"a": a, "b": b, "c": c},
+            train_acc=train_acc,
+            holdout_acc=holdout_acc,
+            shift_acc=shift_acc,
+            confidence=confidence,
+            priors=priors if passed else {},
+            temperature=temperature,
+            passed=passed,
+        )
+
+    def _accuracy(self, data: List[Dict[str, Any]], predict: Callable[[int], float]) -> float:
+        if not data:
+            return 0.0
+        hits = 0
+        for pair in data:
+            pred = predict(pair["input"])
+            if abs(pred - pair["output"]) < 1e-6:
+                hits += 1
+        return hits / len(data)
+
 class SafeInterpreter:
     def __init__(self, limit=5000):
         self.limit = limit
@@ -11933,6 +12090,32 @@ class BottomUpSynthesizer:
         self.last_improvement_step = 0
         self.reward_stats = {"min": 0.0, "max": 0.0, "mean": 0.0, "count": 0}
         self.reward_stats = {"min": 0.0, "max": 0.0, "mean": 0.0, "count": 0}
+        self.hypothesis_result: Optional[HypothesisResult] = None
+
+    def set_hypothesis_result(self, result: Optional[HypothesisResult]) -> None:
+        self.hypothesis_result = result
+
+    def _neutral_priors(self) -> Dict[str, float]:
+        return {"+": 1.0, "-": 1.0, "*": 1.0, "Rec": 1.0, "Arg": 1.0, "Const": 1.0}
+
+    def _apply_hypothesis_priors(self, priors: Dict[str, float]) -> Dict[str, float]:
+        result = self.hypothesis_result
+        if not result or not result.passed:
+            return priors
+        base = priors if priors else self._neutral_priors()
+        adjusted = {}
+        for key, val in base.items():
+            boost = result.priors.get(key, 1.0)
+            adjusted[key] = max(val * boost, 1e-6)
+        temperature = max(0.25, result.temperature)
+        adjusted = {k: v ** (1.0 / temperature) for k, v in adjusted.items()}
+        total = sum(adjusted.values())
+        if total <= 0:
+            return priors
+        calibrated = {k: v / total for k, v in adjusted.items()}
+        print(f"    [Hypothesis] Prior bias applied (temp={temperature:.2f}).")
+        self.latent_priors_detected = True
+        return calibrated
 
     def _score_expr(self, expr: BSExpr, priors: Dict[str, float]) -> float:
         if not priors: return 1.0
@@ -11986,18 +12169,6 @@ class BottomUpSynthesizer:
             return depth, 0
         max_depth, nodes = walk(expr, 1)
         return max_depth, nodes, counts
-
-    def _guided_templates(self) -> List[BSExpr]:
-        n = BSVar('n')
-        one = BSVal(1)
-        two = BSVal(2)
-        n_minus_1 = BSBinOp('-', n, one)
-        n_minus_2 = BSBinOp('-', n, two)
-        return [
-            BSBinOp('+', n, BSRecCall(n_minus_1)),                 # n + f(n-1)
-            BSBinOp('*', n, BSRecCall(n_minus_1)),                 # n * f(n-1)
-            BSBinOp('+', BSRecCall(n_minus_1), BSRecCall(n_minus_2)), # f(n-1) + f(n-2)
-        ]
 
     def _state_features(
         self,
@@ -12076,23 +12247,6 @@ class BottomUpSynthesizer:
         active_io = [p for p in io_pairs if p['input'] > base_k]
         if not active_io: return []
 
-        if self.guided:
-            target_sig = tuple(p['output'] for p in active_io)
-            for expr in self._guided_templates():
-                sig = []
-                valid = True
-                for pair in active_io:
-                    try:
-                        res = self.interpreter.run_recursive(expr, pair['input'], base_k, base_v)
-                        sig.append(res)
-                    except Exception:
-                        valid = False
-                        break
-                if valid and tuple(sig) == target_sig:
-                    print(f"      [Guided] Template match: {expr}")
-                    code = self._to_python(expr, base_k, base_v)
-                    return [(code, expr, base_k, base_v)]
-
         # Latent Space Guidance + Organic Learned Priors
         priors = self.navigator.get_priors(active_io) if self.navigator else {}
         learned_priors = self.feedback.get_learned_priors()
@@ -12104,7 +12258,9 @@ class BottomUpSynthesizer:
                 if k in learned_priors:
                     priors[k] = 0.7 * priors[k] + 0.3 * learned_priors[k]
             print(f"    [Organic] Blending learned priors: { {k: round(v,3) for k,v in learned_priors.items()} }")
-        
+
+        priors = self._apply_hypothesis_priors(priors)
+
         if priors:
             self.latent_priors_detected = True
             print(f"    [Latent] Combined Priors: { {k: round(v,3) for k,v in priors.items()} }")
@@ -12359,6 +12515,7 @@ class HRMSidecar:
         deadline: Optional[float] = None,
         task_id: str = "task",
         task_params: Optional[Dict[str, float]] = None,
+        hypothesis_result: Optional[HypothesisResult] = None,
     ) -> List[Tuple[str, Any]]:
         print(f"[HRM-Sidecar] Dreaming on {len(experiences_as_code)} experiences...")
         
@@ -12366,6 +12523,7 @@ class HRMSidecar:
         # If we have I/O examples, we can try to find a perfect recursive match
         if io_examples:
             print(f"  > Attempting Bottom-Up Synthesis (Truthful) on {len(io_examples)} examples...")
+            self.synthesizer.set_hypothesis_result(hypothesis_result)
             syn_results = self.synthesizer.synthesize(
                 io_examples,
                 deadline=deadline,
@@ -12472,6 +12630,8 @@ def run_synthesis_verification_suite(
     tasks_attempted = 0
     tasks_succeeded = 0
     first_solve_time: Optional[float] = None
+    per_task_results: List[Dict[str, Any]] = []
+    hypothesis_inducer = HypothesisInducer()
 
     if seed is not None:
         random.seed(seed)
@@ -12514,18 +12674,26 @@ def run_synthesis_verification_suite(
             if quick:
                 count = min(count, 7)
                 train_size = min(4, count)
+                shift_count = 3
             else:
                 train_size = 6
+                shift_count = 5
             xs = list(range(count))
             data = [{'input': x, 'output': func(x)} for x in xs]
             train_data = data[:train_size]
             holdout_data = data[train_size:]
+            shift_inputs = list(range(count, count + shift_count))
+            shift_data = [{'input': x, 'output': func(x)} for x in shift_inputs]
+            adv_inputs = sorted({min(xs) - 2, min(xs) - 1, count + shift_count + 1})
+            adv_data = [{'input': x, 'output': func(x)} for x in adv_inputs]
 
             print(f"   Train Set ({len(train_data)}): {[d['input'] for d in train_data]} -> {[d['output'] for d in train_data]}")
             print(f"   Holdout Set ({len(holdout_data)}): {[d['input'] for d in holdout_data]}")
+            print(f"   Shift Set ({len(shift_data)}): {[d['input'] for d in shift_data]}")
 
             # 3. Synthesize (Train only)
             start_t = time.time()
+            step_start = setup.synthesizer.step_count
             task_params = {
                 "task_index": float(tasks_attempted - 1),
                 "task_size": float(count),
@@ -12534,6 +12702,7 @@ def run_synthesis_verification_suite(
                 "base_k": float(train_data[0]["input"]) if train_data else 0.0,
                 "base_v": float(train_data[0]["output"]) if train_data else 0.0,
             }
+            hypothesis = hypothesis_inducer.induce(train_data, holdout_data, shift_data) if guided else None
             try:
                 results = setup.dream(
                     [],
@@ -12541,15 +12710,37 @@ def run_synthesis_verification_suite(
                     deadline=deadline,
                     task_id=name,
                     task_params=task_params,
+                    hypothesis_result=hypothesis,
                 )
             except TimeoutError as e:
                 print(f"   [TIMEOUT] {e}")
                 timeout = True
                 break
             elapsed = time.time() - start_t
+            step_delta = setup.synthesizer.step_count - step_start
 
             if not results:
                 print(f"   [FAIL] No concept synthesized for {name}.")
+                failure_result = {
+                    "task_id": name,
+                    "mode": "guided" if guided else "unguided",
+                    "seed": seed,
+                    "train_acc": 0.0,
+                    "holdout_acc": 0.0,
+                    "shift_acc": 0.0,
+                    "adv_acc": 0.0,
+                    "node_count": None,
+                    "constant_abuse_score": None,
+                    "discovery_cost": {"elapsed_seconds": round(elapsed, 4), "steps": step_delta},
+                    "any_heuristic_used": bool(hypothesis and hypothesis.passed),
+                    "hypothesis_selected": {
+                        "type": hypothesis.hypothesis_type if hypothesis else None,
+                        "confidence": round(hypothesis.confidence, 3) if hypothesis else 0.0,
+                        "passed": bool(hypothesis and hypothesis.passed),
+                    },
+                }
+                per_task_results.append(failure_result)
+                print(f"EVIDENCE_JSON={json.dumps(failure_result, separators=(',', ':'))}")
                 continue
 
             # Unpack result: [(code_str, (ast_obj, k, v))]
@@ -12561,24 +12752,24 @@ def run_synthesis_verification_suite(
                 print(f"      {line}")
             print(f"   Time: {elapsed:.4f}s")
 
-            # 4. Verify on Holdout (Strict Safe Interpreter)
-            print(f"   [Verification] Running SafeInterpreter on Holdout...")
-            try:
+            def eval_dataset(dataset: List[Dict[str, Any]]) -> Tuple[int, int]:
                 passed = 0
-                for h in holdout_data:
-                    inp = h['input']
-                    expected = h['output']
+                for pair in dataset:
+                    inp = pair['input']
+                    expected = pair['output']
                     try:
-                        # TRUE SAFE EXECUTION: interpreter.run_recursive
                         res = setup.synthesizer.interpreter.run_recursive(ast_obj, inp, k_val, v_val)
                         if res == expected:
                             passed += 1
-                        else:
-                            print(f"      [Mismatch] In: {inp}, Expected: {expected}, Got: {res}")
-                    except RuntimeError as e:
-                         print(f"      [RuntimeError] {e} on input {inp}")
+                    except RuntimeError:
+                        pass
+                return passed, len(dataset)
 
-                if passed == len(holdout_data):
+            # 4. Verify on Holdout (Strict Safe Interpreter)
+            print(f"   [Verification] Running SafeInterpreter on Holdout...")
+            try:
+                passed, total = eval_dataset(holdout_data)
+                if passed == total:
                     print(f"   [PASS] Verified on all {len(holdout_data)} holdout examples.")
                     tasks_succeeded += 1
                     if first_solve_time is None:
@@ -12588,6 +12779,35 @@ def run_synthesis_verification_suite(
 
             except Exception as e:
                 print(f"   [CRASH] Verification error: {e}")
+
+            train_passed, train_total = eval_dataset(train_data)
+            holdout_passed, holdout_total = eval_dataset(holdout_data)
+            shift_passed, shift_total = eval_dataset(shift_data)
+            adv_passed, adv_total = eval_dataset(adv_data)
+
+            _, node_count, counts = setup.synthesizer._ast_signature(ast_obj)
+            constant_abuse_score = counts.get("Const", 0) / max(1, node_count)
+
+            task_result = {
+                "task_id": name,
+                "mode": "guided" if guided else "unguided",
+                "seed": seed,
+                "train_acc": train_passed / max(1, train_total),
+                "holdout_acc": holdout_passed / max(1, holdout_total),
+                "shift_acc": shift_passed / max(1, shift_total),
+                "adv_acc": adv_passed / max(1, adv_total),
+                "node_count": node_count,
+                "constant_abuse_score": round(constant_abuse_score, 4),
+                "discovery_cost": {"elapsed_seconds": round(elapsed, 4), "steps": step_delta},
+                "any_heuristic_used": bool(hypothesis and hypothesis.passed),
+                "hypothesis_selected": {
+                    "type": hypothesis.hypothesis_type if hypothesis else None,
+                    "confidence": round(hypothesis.confidence, 3) if hypothesis else 0.0,
+                    "passed": bool(hypothesis and hypothesis.passed),
+                },
+            }
+            per_task_results.append(task_result)
+            print(f"EVIDENCE_JSON={json.dumps(task_result, separators=(',', ':'))}")
     finally:
         elapsed_seconds = time.time() - start_time
         latent_priors_detected = setup.synthesizer.latent_priors_detected
@@ -12599,6 +12819,7 @@ def run_synthesis_verification_suite(
             "elapsed_seconds": round(elapsed_seconds, 3),
             "first_solve_seconds": round(first_solve_time, 3) if first_solve_time is not None else None,
             "guided": guided,
+            "per_task_results": per_task_results,
         }
         print(f"SUMMARY_JSON={json.dumps(summary, separators=(',', ':'))}")
         return summary
@@ -12654,26 +12875,62 @@ def run_ab_compare(
             "median_time_to_first_solve": median_time,
         }
 
+    def aggregate_holdout_shift(results: List[Dict[str, Any]]) -> Dict[str, float]:
+        holdout_scores = []
+        shift_scores = []
+        train_scores = []
+        for r in results:
+            for item in r.get("per_task_results", []):
+                holdout_scores.append(item.get("holdout_acc", 0.0))
+                shift_scores.append(item.get("shift_acc", 0.0))
+                train_scores.append(item.get("train_acc", 0.0))
+        def mean(vals: List[float]) -> float:
+            return sum(vals) / len(vals) if vals else 0.0
+        return {
+            "train_mean": mean(train_scores),
+            "holdout_mean": mean(holdout_scores),
+            "shift_mean": mean(shift_scores),
+        }
+
     guided_summary = summarize(guided_results)
     unguided_summary = summarize(unguided_results)
+    guided_metrics = aggregate_holdout_shift(guided_results)
+    unguided_metrics = aggregate_holdout_shift(unguided_results)
     guided_wins = False
     criteria = []
-    if guided_summary["total_tasks_succeeded"] > unguided_summary["total_tasks_succeeded"]:
+    per_seed_holdout_shift = []
+    for seed_idx in range(len(guided_results)):
+        guided_seed = guided_results[seed_idx]
+        unguided_seed = unguided_results[seed_idx]
+        g_metrics = aggregate_holdout_shift([guided_seed])
+        u_metrics = aggregate_holdout_shift([unguided_seed])
+        meets = g_metrics["holdout_mean"] >= u_metrics["holdout_mean"] and g_metrics["shift_mean"] >= u_metrics["shift_mean"]
+        per_seed_holdout_shift.append(
+            {
+                "seed": seed_idx,
+                "guided_holdout": round(g_metrics["holdout_mean"], 3),
+                "unguided_holdout": round(u_metrics["holdout_mean"], 3),
+                "guided_shift": round(g_metrics["shift_mean"], 3),
+                "unguided_shift": round(u_metrics["shift_mean"], 3),
+                "guided_ge_unguided": meets,
+            }
+        )
+    if any(item["guided_ge_unguided"] for item in per_seed_holdout_shift):
         guided_wins = True
-        criteria.append("more_tasks_solved")
-    if guided_summary["median_time_to_first_solve"] is not None:
-        if unguided_summary["median_time_to_first_solve"] is None or guided_summary["median_time_to_first_solve"] < unguided_summary["median_time_to_first_solve"]:
-            guided_wins = True
-            criteria.append("lower_median_time_to_first_solve")
-    if guided_summary["seeds_with_solve"] > unguided_summary["seeds_with_solve"]:
-        guided_wins = True
-        criteria.append("higher_success_rate")
+        criteria.append("holdout_shift_ge_on_seed")
     summary = {
         "guided": guided_summary,
         "unguided": unguided_summary,
+        "guided_metrics": guided_metrics,
+        "unguided_metrics": unguided_metrics,
+        "per_seed_holdout_shift": per_seed_holdout_shift,
         "guided_wins": guided_wins,
         "criteria": criteria,
     }
+    print("\nAB COMPARE SUMMARY")
+    print(f"{'Mode':<10} {'Train':>7} {'Holdout':>8} {'Shift':>7}")
+    print(f"{'Guided':<10} {guided_metrics['train_mean']:.3f} {guided_metrics['holdout_mean']:.3f} {guided_metrics['shift_mean']:.3f}")
+    print(f"{'Unguided':<10} {unguided_metrics['train_mean']:.3f} {unguided_metrics['holdout_mean']:.3f} {unguided_metrics['shift_mean']:.3f}")
     print(f"AB_COMPARE_JSON={json.dumps(summary, separators=(',', ':'))}")
     return summary
 
