@@ -11660,8 +11660,64 @@ class LatentNavigator(nn.Module if torch else object):
          
          priors = {k: v for k, v in zip(NAVIGATOR_ATOM_MAP, probs)}
          
-         # NOTE: Fibonacci detection removed - organic learning will handle pattern recognition
+         # RESEARCH: General Heuristics (Growth Analysis)
+         # Detect non-linear growth patterns using discrete derivatives
+         growth_priors = self._analyze_growth(io_pairs)
+         if growth_priors:
+             # Blend: 50% Navigator, 30% Learned (if any), 20% Heuristic
+             # Or simpler: Boost existing priors with heuristic suggestions
+             print(f"    [Heuristic] Growth Analysis suggests: {growth_priors}")
+             for op, boost in growth_priors.items():
+                 if op in priors:
+                     priors[op] = max(priors[op], boost) # Take max to respect strong heuristic signals
+         
          return priors
+
+    def _analyze_growth(self, io_pairs: List[Dict[str, Any]]) -> Dict[str, float]:
+        """
+        Analyzes the growth rate of outputs to suggest operators.
+        Logic:
+        - Constant delta -> Linear -> '+', '-'
+        - Increasing delta (Acceleration) -> Non-linear -> 'Rec', '*'
+        - Rapid growth (Doubling+) -> Exponential -> 'Rec'
+        """
+        if len(io_pairs) < 3: return {}
+        
+        try:
+            #Sort by input to ensure sequence
+            sorted_pairs = sorted(io_pairs, key=lambda p: p['input'])
+            outputs = [float(p['output']) for p in sorted_pairs if isinstance(p['output'], (int, float))]
+            
+            if len(outputs) < 3: return {}
+            
+            # 1st Derivative (Velocity)
+            deltas = [outputs[i] - outputs[i-1] for i in range(1, len(outputs))]
+            
+            # 2nd Derivative (Acceleration)
+            accels = [deltas[i] - deltas[i-1] for i in range(1, len(deltas))]
+            
+            avg_accel = sum(accels) / len(accels)
+            
+            suggestions = {}
+            
+            # Pattern Recognition
+            if abs(avg_accel) < 0.001:
+                # Linear growth (Constant velocity)
+                suggestions['+'] = 0.6
+                suggestions['-'] = 0.4
+            elif avg_accel > 0:
+                # Accelerating growth -> Non-linear
+                suggestions['*'] = 0.5
+                suggestions['Rec'] = 0.5
+                
+                # Check for exponential/rapid growth (e.g., doubling)
+                is_rapid = all(outputs[i] >= 1.5 * outputs[i-1] for i in range(2, len(outputs)) if outputs[i-1] > 0)
+                if is_rapid:
+                    suggestions['Rec'] = 0.8 # Strong suggestion for recursion
+            
+            return suggestions
+        except Exception:
+            return {}
 
     def learn(self, io_pairs: List[Dict[str, Any]], used_atoms: List[str]):
          if not self.active: return
