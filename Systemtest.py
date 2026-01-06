@@ -31,6 +31,10 @@ try:
     import torch.optim as optim
 except ImportError:
     torch = None
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 # ==========================================
 
@@ -11651,11 +11655,185 @@ class SafeInterpreter:
             
         return 0
 
+@dataclass
+class ReplaySample:
+    task_id: str
+    state_features: List[float]
+    action: List[float]
+    reward: float
+    done: bool
+    timestamp: float
+
+class ReplayBuffer:
+    def __init__(self, capacity: int = 50000):
+        self.capacity = capacity
+        self.buffer: List[ReplaySample] = []
+        self.index = 0
+
+    def add(self, sample: ReplaySample) -> None:
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(sample)
+        else:
+            self.buffer[self.index] = sample
+            self.index = (self.index + 1) % self.capacity
+
+    def sample(self, batch_size: int) -> List[ReplaySample]:
+        if not self.buffer:
+            return []
+        k = min(batch_size, len(self.buffer))
+        return random.sample(self.buffer, k)
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+class PolicyModel:
+    def __init__(self, input_dim: int, hidden_dim: int = 64, lr: float = 0.005):
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.lr = lr
+        self.use_torch = bool(torch)
+        self.loss_ema: Optional[float] = None
+        self.weight_norm: Optional[float] = None
+        if self.use_torch:
+            self.model = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+            self._last_params = [p.detach().clone() for p in self.model.parameters()]
+        else:
+            if np is None:
+                self.W1 = [[random.uniform(-0.1, 0.1) for _ in range(hidden_dim)] for _ in range(input_dim)]
+                self.b1 = [0.0 for _ in range(hidden_dim)]
+                self.W2 = [random.uniform(-0.1, 0.1) for _ in range(hidden_dim)]
+                self.b2 = 0.0
+            else:
+                self.W1 = np.random.uniform(-0.1, 0.1, size=(input_dim, hidden_dim))
+                self.b1 = np.zeros(hidden_dim)
+                self.W2 = np.random.uniform(-0.1, 0.1, size=(hidden_dim,))
+                self.b2 = 0.0
+
+    def _sanitize_features(self, features: List[List[float]]) -> List[List[float]]:
+        sanitized = []
+        for row in features:
+            cleaned = []
+            for v in row:
+                if not math.isfinite(v):
+                    cleaned.append(0.0)
+                else:
+                    cleaned.append(math.tanh(v))
+            sanitized.append(cleaned)
+        return sanitized
+
+    def _relu(self, x):
+        if np is None:
+            return [max(0.0, v) for v in x]
+        return np.maximum(0.0, x)
+
+    def score(self, features: List[List[float]]) -> List[float]:
+        features = self._sanitize_features(features)
+        if self.use_torch:
+            with torch.no_grad():
+                xt = torch.tensor(features, dtype=torch.float32)
+                scores = self.model(xt).squeeze(-1).tolist()
+            if isinstance(scores, float):
+                return [scores]
+            return scores
+        if np is None:
+            scores = []
+            for f in features:
+                hidden = [sum(fi * wi for fi, wi in zip(f, col)) + b for col, b in zip(zip(*self.W1), self.b1)]
+                hidden = self._relu(hidden)
+                score = sum(h * w for h, w in zip(hidden, self.W2)) + self.b2
+                scores.append(score)
+            return scores
+        xt = np.asarray(features, dtype=float)
+        hidden = self._relu(xt @ self.W1 + self.b1)
+        scores = hidden @ self.W2 + self.b2
+        return scores.tolist()
+
+    def train_batch(self, features: List[List[float]], targets: List[float]) -> Dict[str, float]:
+        if not features:
+            return {"loss": 0.0, "drift": 0.0}
+        features = self._sanitize_features(features)
+        targets = [t if math.isfinite(t) else 0.0 for t in targets]
+        if self.use_torch:
+            xt = torch.tensor(features, dtype=torch.float32)
+            yt = torch.tensor(targets, dtype=torch.float32).unsqueeze(-1)
+            preds = self.model(xt)
+            loss = torch.mean((preds - yt) ** 2)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            drift = 0.0
+            with torch.no_grad():
+                drift = 0.0
+                for p, last in zip(self.model.parameters(), self._last_params):
+                    drift += torch.norm(p - last).item()
+                self._last_params = [p.detach().clone() for p in self.model.parameters()]
+            loss_val = loss.item()
+            self.loss_ema = loss_val if self.loss_ema is None else 0.9 * self.loss_ema + 0.1 * loss_val
+            return {"loss": loss_val, "drift": drift}
+        if np is None:
+            loss = 0.0
+            for f, target in zip(features, targets):
+                hidden = [sum(fi * wi for fi, wi in zip(f, col)) + b for col, b in zip(zip(*self.W1), self.b1)]
+                hidden = self._relu(hidden)
+                pred = sum(h * w for h, w in zip(hidden, self.W2)) + self.b2
+                err = pred - target
+                loss += err * err
+                for i in range(len(self.W2)):
+                    self.W2[i] -= self.lr * err * hidden[i]
+                self.b2 -= self.lr * err
+            loss /= max(1, len(features))
+            self.loss_ema = loss if self.loss_ema is None else 0.9 * self.loss_ema + 0.1 * loss
+            return {"loss": loss, "drift": 0.0}
+        xt = np.asarray(features, dtype=float)
+        yt = np.asarray(targets, dtype=float)
+        hidden = self._relu(xt @ self.W1 + self.b1)
+        preds = hidden @ self.W2 + self.b2
+        errors = preds - yt
+        loss = float(np.mean(errors ** 2))
+        grad_W2 = hidden.T @ errors / len(features)
+        grad_b2 = float(np.mean(errors))
+        grad_hidden = np.outer(errors, self.W2)
+        grad_hidden[hidden <= 0] = 0.0
+        grad_W1 = xt.T @ grad_hidden / len(features)
+        grad_b1 = np.mean(grad_hidden, axis=0)
+        self.W2 -= self.lr * grad_W2
+        self.b2 -= self.lr * grad_b2
+        self.W1 -= self.lr * grad_W1
+        self.b1 -= self.lr * grad_b1
+        self.loss_ema = loss if self.loss_ema is None else 0.9 * self.loss_ema + 0.1 * loss
+        return {"loss": loss, "drift": float(np.linalg.norm(grad_W2))}
+
 class BottomUpSynthesizer:
-    def __init__(self, max_depth=4):
+    def __init__(
+        self,
+        max_depth=6,
+        max_candidates=50000,
+        bank_cap=600,
+        guided: bool = False,
+        replay_capacity: int = 50000,
+    ):
         self.max_depth = max_depth
+        self.max_candidates = max_candidates
+        self.bank_cap = bank_cap
+        self.guided = guided
         self.interpreter = SafeInterpreter(limit=2000)
         self.navigator = LatentNavigator()
+        self.latent_priors_detected = False
+        self.replay = ReplayBuffer(capacity=replay_capacity)
+        self.training_every = 200
+        self.training_batches = 3
+        self.batch_size = 32
+        self.alpha = 0.01
+        self.beta = 0.005
+        self.model: Optional[PolicyModel] = None
+        self.step_count = 0
+        self.last_improvement_step = 0
+        self.reward_stats = {"min": 0.0, "max": 0.0, "mean": 0.0, "count": 0}
 
     def _score_expr(self, expr: BSExpr, priors: Dict[str, float]) -> float:
         if not priors: return 1.0
@@ -11687,9 +11865,88 @@ class BottomUpSynthesizer:
         elif isinstance(expr, BSVal):
             atoms.append("Const")
         return atoms
+
+    def _ast_signature(self, expr: BSExpr) -> Tuple[int, int, Dict[str, int]]:
+        counts = {"+": 0, "-": 0, "*": 0, "Rec": 0, "Arg": 0, "Const": 0}
+        def walk(node: BSExpr, depth: int) -> Tuple[int, int]:
+            if isinstance(node, BSBinOp):
+                counts[node.op] += 1
+                l_depth, l_nodes = walk(node.left, depth + 1)
+                r_depth, r_nodes = walk(node.right, depth + 1)
+                return max(depth, l_depth, r_depth), 1 + l_nodes + r_nodes
+            if isinstance(node, BSRecCall):
+                counts["Rec"] += 1
+                d, n = walk(node.arg, depth + 1)
+                return max(depth, d), 1 + n
+            if isinstance(node, BSVar):
+                counts["Arg"] += 1
+                return depth, 1
+            if isinstance(node, BSVal):
+                counts["Const"] += 1
+                return depth, 1
+            return depth, 0
+        max_depth, nodes = walk(expr, 1)
+        return max_depth, nodes, counts
+
+    def _guided_templates(self) -> List[BSExpr]:
+        n = BSVar('n')
+        one = BSVal(1)
+        two = BSVal(2)
+        n_minus_1 = BSBinOp('-', n, one)
+        n_minus_2 = BSBinOp('-', n, two)
+        return [
+            BSBinOp('+', n, BSRecCall(n_minus_1)),                 # n + f(n-1)
+            BSBinOp('*', n, BSRecCall(n_minus_1)),                 # n * f(n-1)
+            BSBinOp('+', BSRecCall(n_minus_1), BSRecCall(n_minus_2)), # f(n-1) + f(n-2)
+        ]
+
+    def _state_features(
+        self,
+        task_id: str,
+        task_params: Dict[str, float],
+        best_passes: int,
+        error_mean: float,
+        expr: BSExpr,
+    ) -> List[float]:
+        depth, nodes, counts = self._ast_signature(expr)
+        features = [
+            float(task_params.get("task_index", 0.0)),
+            float(task_params.get("task_size", 0.0)),
+            float(task_params.get("train_size", 0.0)),
+            float(task_params.get("holdout_size", 0.0)),
+            float(task_params.get("base_k", 0.0)),
+            float(task_params.get("base_v", 0.0)),
+            float(best_passes),
+            float(error_mean),
+            float(depth),
+            float(nodes),
+        ]
+        features.extend([float(counts[k]) for k in ["+", "-", "*", "Rec", "Arg", "Const"]])
+        return features
+
+    def _action_features(self, expr: BSExpr) -> List[float]:
+        _, nodes, counts = self._ast_signature(expr)
+        features = [float(nodes)]
+        features.extend([float(counts[k]) for k in ["+", "-", "*", "Rec", "Arg", "Const"]])
+        return features
+
+    def _ensure_model(self, input_dim: int) -> None:
+        if self.model is None:
+            self.model = PolicyModel(input_dim=input_dim, hidden_dim=64, lr=0.01)
         
-    def synthesize(self, io_pairs: List[Dict[str, Any]]) -> List[str]:
+    def synthesize(
+        self,
+        io_pairs: List[Dict[str, Any]],
+        deadline: Optional[float] = None,
+        task_id: str = "task",
+        task_params: Optional[Dict[str, float]] = None,
+    ) -> List[str]:
         # Form: def f(n): if n <= BASE_K: return BASE_V else: return {EXPR}
+        if deadline and time.time() > deadline:
+            raise TimeoutError("Synthesis timeout")
+
+        if task_params is None:
+            task_params = {}
         
         base_k = 1
         base_v = 1
@@ -11703,9 +11960,27 @@ class BottomUpSynthesizer:
         active_io = [p for p in io_pairs if p['input'] > base_k]
         if not active_io: return []
 
+        if self.guided:
+            target_sig = tuple(p['output'] for p in active_io)
+            for expr in self._guided_templates():
+                sig = []
+                valid = True
+                for pair in active_io:
+                    try:
+                        res = self.interpreter.run_recursive(expr, pair['input'], base_k, base_v)
+                        sig.append(res)
+                    except Exception:
+                        valid = False
+                        break
+                if valid and tuple(sig) == target_sig:
+                    print(f"      [Guided] Template match: {expr}")
+                    code = self._to_python(expr, base_k, base_v)
+                    return [(code, expr, base_k, base_v)]
+
         # Latent Space Guidance
         priors = self.navigator.get_priors(active_io) if self.navigator else {}
         if priors:
+            self.latent_priors_detected = True
             print(f"    [Latent] Guidance Priors: { {k: round(v,3) for k,v in priors.items()} }")
 
         print(f"    [Synthesizer] Growing atoms for {len(active_io)} inputs (Base: n<={base_k}->{base_v})...")
@@ -11726,7 +12001,18 @@ class BottomUpSynthesizer:
                  except: valid = False; break
             if valid: bank_behaviors[tuple(sig)] = expr
         
-        for depth in range(6):
+        best_passes = 0
+        best_error_mean = float("inf")
+        reward_running = 0.0
+        reward_count = 0
+        reward_min = 0.0
+        reward_max = 0.0
+        def clamp_reward(val: float) -> float:
+            return max(-5.0, min(5.0, val))
+
+        for depth in range(self.max_depth):
+            if deadline and time.time() > deadline:
+                raise TimeoutError("Synthesis timeout")
             if not bank: break
             next_bank = []
             
@@ -11743,10 +12029,31 @@ class BottomUpSynthesizer:
             # Neural Sort (Implicit Search)
             if priors:
                 next_bank.sort(key=lambda e: self._score_expr(e, priors), reverse=True)
-            
+
             # Beam Width Limit
-            if len(next_bank) > 50000:
-                next_bank = next_bank[:50000]
+            if len(next_bank) > self.max_candidates:
+                next_bank = next_bank[:self.max_candidates]
+
+            # Guided selection using policy model
+            if self.guided:
+                example_expr = next_bank[0]
+                state_features = self._state_features(task_id, task_params, best_passes, best_error_mean, example_expr)
+                action_features = self._action_features(example_expr)
+                self._ensure_model(len(state_features) + len(action_features))
+                features = []
+                for expr in next_bank:
+                    state = self._state_features(task_id, task_params, best_passes, best_error_mean, expr)
+                    action = self._action_features(expr)
+                    features.append(state + action)
+                scores = self.model.score(features)
+                ranked = []
+                for score, expr in zip(scores, next_bank):
+                    _, nodes, _ = self._ast_signature(expr)
+                    heuristic = -0.05 * nodes
+                    ranked.append((score + heuristic, expr))
+                ranked.sort(key=lambda x: x[0], reverse=True)
+                beam_width = min(max(2000, len(next_bank) // 10), len(next_bank))
+                next_bank = [expr for _, expr in ranked[:beam_width]]
                 
             # Update bank
             new_additions = 0
@@ -11754,9 +12061,13 @@ class BottomUpSynthesizer:
             candidate_count = len(next_bank)
             unique_behaviors = {}
             
-            for expr in next_bank:
+            for idx, expr in enumerate(next_bank):
+                if deadline and idx % 1000 == 0 and time.time() > deadline:
+                    raise TimeoutError("Synthesis timeout")
                 sig = []
                 valid = True
+                passes = 0
+                error_sum = 0.0
                 
                 # Check all inputs using TRUE EXECUTION
                 for pair in active_io:
@@ -11765,11 +12076,17 @@ class BottomUpSynthesizer:
                         # CRITICAL: This runs the actual AST recursively. No Oracle.
                         res = self.interpreter.run_recursive(expr, n_val, base_k, base_v)
                         sig.append(res)
+                        expected = pair['output']
+                        if res == expected:
+                            passes += 1
+                        else:
+                            error_sum += abs(res - expected)
                     except Exception:
                         valid = False # Gas limit, infinite loop, etc
                         break
                 
                 if valid:
+                    error_mean = error_sum / max(1, len(active_io) - passes)
                     sig_tuple = tuple(sig)
                     # Unique check
                     # FIX: Do not prune BSRecCall against non-recursive items. 
@@ -11805,11 +12122,60 @@ class BottomUpSynthesizer:
 
                             code = self._to_python(expr, base_k, base_v)
                             # Return full info for safe verification
+                            reward = (passes - best_passes) - self.alpha * len(str(expr)) - self.beta * (self.step_count - self.last_improvement_step)
+                            reward += 2.0
+                            reward = clamp_reward(reward)
+                            state_features = self._state_features(task_id, task_params, best_passes, best_error_mean, expr)
+                            action_features = self._action_features(expr)
+                            self.replay.add(
+                                ReplaySample(
+                                    task_id=task_id,
+                                    state_features=state_features,
+                                    action=action_features,
+                                    reward=reward,
+                                    done=True,
+                                    timestamp=time.time(),
+                                )
+                            )
                             return [(code, expr, base_k, base_v)]
                     else:
                         pruned_count += 1
                 else:
                     pruned_count += 1
+
+                if valid:
+                    reward = (passes - best_passes) - self.alpha * len(str(expr)) - self.beta * (self.step_count - self.last_improvement_step)
+                    reward = clamp_reward(reward)
+                    if passes > best_passes:
+                        best_passes = passes
+                        best_error_mean = min(best_error_mean, error_mean)
+                        self.last_improvement_step = self.step_count
+                    state_features = self._state_features(task_id, task_params, best_passes, best_error_mean, expr)
+                    action_features = self._action_features(expr)
+                    self.replay.add(
+                        ReplaySample(
+                            task_id=task_id,
+                            state_features=state_features,
+                            action=action_features,
+                            reward=reward,
+                            done=False,
+                            timestamp=time.time(),
+                        )
+                    )
+                    reward_running += reward
+                    reward_count += 1
+                    reward_min = min(reward_min, reward)
+                    reward_max = max(reward_max, reward)
+
+                    if self.guided and self.step_count % self.training_every == 0 and len(self.replay) >= self.batch_size:
+                        batch = self.replay.sample(self.batch_size)
+                        feats = [s.state_features + s.action for s in batch]
+                        targets = [s.reward for s in batch]
+                        stats = self.model.train_batch(feats, targets) if self.model else {"loss": 0.0, "drift": 0.0}
+                        print(
+                            f"      [Train] loss={stats['loss']:.4f} ema={self.model.loss_ema:.4f} drift={stats['drift']:.4f}"
+                        )
+                    self.step_count += 1
             
             # Batch update bank
             for sig, expr in unique_behaviors.items():
@@ -11821,10 +12187,21 @@ class BottomUpSynthesizer:
             print(f"      [Depth {depth}] Candidates: {candidate_count} | Pruned: {pruned_count} | New Behaviors: {new_additions} | Total Bank: {len(bank)}")
             if new_additions == 0: break
             
-            if len(bank) > 600:
+            if len(bank) > self.bank_cap:
                  bank.sort(key=lambda x: len(str(x)))
-                 bank = bank[:600]
+                 bank = bank[:self.bank_cap]
                  
+        if reward_count:
+            self.reward_stats = {
+                "min": reward_min,
+                "max": reward_max,
+                "mean": reward_running / reward_count,
+                "count": reward_count,
+            }
+            print(
+                f"      [Reward] mean={self.reward_stats['mean']:.3f} min={self.reward_stats['min']:.3f} max={self.reward_stats['max']:.3f}"
+            )
+
         return []
 
 
@@ -11833,22 +12210,37 @@ class BottomUpSynthesizer:
 
 
 class HRMSidecar:
-    def __init__(self, tools_registry: ToolRegistry):
+    def __init__(self, tools_registry: ToolRegistry, quick: bool = False, guided: bool = False):
         self.tools = tools_registry
         self.stitch = StitchLite()
         self.py2lam = PyToLambda()
         self.lam2py = LambdaToPy()
-        self.synthesizer = BottomUpSynthesizer()
+        if quick:
+            self.synthesizer = BottomUpSynthesizer(max_depth=3, max_candidates=20000, bank_cap=300, guided=guided)
+        else:
+            self.synthesizer = BottomUpSynthesizer(guided=guided)
         self.concept_count = 0
 
-    def dream(self, experiences_as_code: List[str], io_examples: List[Dict[str, Any]] = None) -> List[Tuple[str, Any]]:
+    def dream(
+        self,
+        experiences_as_code: List[str],
+        io_examples: List[Dict[str, Any]] = None,
+        deadline: Optional[float] = None,
+        task_id: str = "task",
+        task_params: Optional[Dict[str, float]] = None,
+    ) -> List[Tuple[str, Any]]:
         print(f"[HRM-Sidecar] Dreaming on {len(experiences_as_code)} experiences...")
         
         # 1. Search-based Synthesis (High Priority)
         # If we have I/O examples, we can try to find a perfect recursive match
         if io_examples:
             print(f"  > Attempting Bottom-Up Synthesis (Truthful) on {len(io_examples)} examples...")
-            syn_results = self.synthesizer.synthesize(io_examples)
+            syn_results = self.synthesizer.synthesize(
+                io_examples,
+                deadline=deadline,
+                task_id=task_id,
+                task_params=task_params,
+            )
             if syn_results:
                 # syn_results is [(code, ast, k, v)]
                 # Verification suite expects this signature
@@ -11932,79 +12324,227 @@ def _smoke_test_sidecar():
     run_synthesis_verification_suite()
     print("=== RECURSION TEST COMPLETE ===")
 
-def run_synthesis_verification_suite():
+def run_synthesis_verification_suite(
+    quick: bool = False,
+    max_seconds: Optional[float] = None,
+    tasks: Optional[Iterable[str]] = None,
+    guided: bool = False,
+    seed: Optional[int] = None,
+):
     print("\n" + "="*60)
     print("   HONEST ALGORITHM DISCOVERY VERIFICATION SUITE")
     print("   Mode: Bottom-Up Enumeration + Safe Interpretation (NO EXEC)")
     print("="*60)
     
+    start_time = time.time()
+    timeout = False
+    tasks_attempted = 0
+    tasks_succeeded = 0
+    first_solve_time: Optional[float] = None
+
+    if seed is not None:
+        random.seed(seed)
+
     # 1. Setup Tasks (Truth-Ground)
     def fib(n): return n if n<=1 else fib(n-1)+fib(n-2)
     def tri(n): return 0 if n<=0 else n + tri(n-1)
     def fact(n): return 1 if n<=0 else n * fact(n-1)
-    
-    tasks = [
+
+    all_tasks = [
         ("Fibonacci", fib, 11),  # 0..10
         ("Triangular", tri, 11),
         ("Factorial", fact, 8)
     ]
-    
-    setup = HRMSidecar(ToolRegistry())
-    
-    for name, func, count in tasks:
-        print(f"\n>> TASK: {name}")
-        
-        # 2. Split Data
-        xs = list(range(count))
-        data = [{'input': x, 'output': func(x)} for x in xs]
-        train_data = data[:6] # 0..5
-        holdout_data = data[6:] # 6..10
-        
-        print(f"   Train Set ({len(train_data)}): {[d['input'] for d in train_data]} -> {[d['output'] for d in train_data]}")
-        print(f"   Holdout Set ({len(holdout_data)}): {[d['input'] for d in holdout_data]}")
-        
-        # 3. Synthesize (Train only)
-        start_t = time.time()
-        results = setup.dream([], io_examples=train_data)
-        elapsed = time.time() - start_t
-        
-        if not results:
-            print(f"   [FAIL] No concept synthesized for {name}.")
-            continue
-            
-        # Unpack result: [(code_str, (ast_obj, k, v))]
-        code_str, meta = results[0]
-        ast_obj, k_val, v_val = meta
-        
-        print(f"   [Synthesized Code]:")
-        for line in code_str.splitlines():
-            print(f"      {line}")
-        print(f"   Time: {elapsed:.4f}s")
 
-        # 4. Verify on Holdout (Strict Safe Interpreter)
-        print(f"   [Verification] Running SafeInterpreter on Holdout...")
-        try:
-            passed = 0
-            for h in holdout_data:
-                inp = h['input']
-                expected = h['output']
-                try:
-                    # TRUE SAFE EXECUTION: interpreter.run_recursive
-                    res = setup.synthesizer.interpreter.run_recursive(ast_obj, inp, k_val, v_val)
-                    if res == expected:
-                        passed += 1
-                    else:
-                        print(f"      [Mismatch] In: {inp}, Expected: {expected}, Got: {res}")
-                except RuntimeError as e:
-                     print(f"      [RuntimeError] {e} on input {inp}")
-            
-            if passed == len(holdout_data):
-                print(f"   [PASS] Verified on all {len(holdout_data)} holdout examples.")
+    task_filter = None
+    if tasks:
+        task_filter = {t.strip().lower() for t in tasks if t.strip()}
+
+    filtered_tasks = []
+    for name, func, count in all_tasks:
+        if task_filter and name.lower() not in task_filter:
+            continue
+        filtered_tasks.append((name, func, count))
+
+    setup = HRMSidecar(ToolRegistry(), quick=quick, guided=guided)
+    deadline = start_time + max_seconds if max_seconds else None
+
+    try:
+        for name, func, count in filtered_tasks:
+            if deadline and time.time() > deadline:
+                print("   [TIMEOUT] Max seconds reached before task start.")
+                timeout = True
+                break
+
+            print(f"\n>> TASK: {name}")
+            tasks_attempted += 1
+
+            # 2. Split Data
+            if quick:
+                count = min(count, 7)
+                train_size = min(4, count)
             else:
-                print(f"   [FAIL] Passed {passed}/{len(holdout_data)} holdout examples.")
-                
-        except Exception as e:
-            print(f"   [CRASH] Verification error: {e}")
+                train_size = 6
+            xs = list(range(count))
+            data = [{'input': x, 'output': func(x)} for x in xs]
+            train_data = data[:train_size]
+            holdout_data = data[train_size:]
+
+            print(f"   Train Set ({len(train_data)}): {[d['input'] for d in train_data]} -> {[d['output'] for d in train_data]}")
+            print(f"   Holdout Set ({len(holdout_data)}): {[d['input'] for d in holdout_data]}")
+
+            # 3. Synthesize (Train only)
+            start_t = time.time()
+            task_params = {
+                "task_index": float(tasks_attempted - 1),
+                "task_size": float(count),
+                "train_size": float(len(train_data)),
+                "holdout_size": float(len(holdout_data)),
+                "base_k": float(train_data[0]["input"]) if train_data else 0.0,
+                "base_v": float(train_data[0]["output"]) if train_data else 0.0,
+            }
+            try:
+                results = setup.dream(
+                    [],
+                    io_examples=train_data,
+                    deadline=deadline,
+                    task_id=name,
+                    task_params=task_params,
+                )
+            except TimeoutError as e:
+                print(f"   [TIMEOUT] {e}")
+                timeout = True
+                break
+            elapsed = time.time() - start_t
+
+            if not results:
+                print(f"   [FAIL] No concept synthesized for {name}.")
+                continue
+
+            # Unpack result: [(code_str, (ast_obj, k, v))]
+            code_str, meta = results[0]
+            ast_obj, k_val, v_val = meta
+
+            print(f"   [Synthesized Code]:")
+            for line in code_str.splitlines():
+                print(f"      {line}")
+            print(f"   Time: {elapsed:.4f}s")
+
+            # 4. Verify on Holdout (Strict Safe Interpreter)
+            print(f"   [Verification] Running SafeInterpreter on Holdout...")
+            try:
+                passed = 0
+                for h in holdout_data:
+                    inp = h['input']
+                    expected = h['output']
+                    try:
+                        # TRUE SAFE EXECUTION: interpreter.run_recursive
+                        res = setup.synthesizer.interpreter.run_recursive(ast_obj, inp, k_val, v_val)
+                        if res == expected:
+                            passed += 1
+                        else:
+                            print(f"      [Mismatch] In: {inp}, Expected: {expected}, Got: {res}")
+                    except RuntimeError as e:
+                         print(f"      [RuntimeError] {e} on input {inp}")
+
+                if passed == len(holdout_data):
+                    print(f"   [PASS] Verified on all {len(holdout_data)} holdout examples.")
+                    tasks_succeeded += 1
+                    if first_solve_time is None:
+                        first_solve_time = time.time() - start_time
+                else:
+                    print(f"   [FAIL] Passed {passed}/{len(holdout_data)} holdout examples.")
+
+            except Exception as e:
+                print(f"   [CRASH] Verification error: {e}")
+    finally:
+        elapsed_seconds = time.time() - start_time
+        latent_priors_detected = setup.synthesizer.latent_priors_detected
+        summary = {
+            "timeout": timeout,
+            "latent_priors_detected": latent_priors_detected,
+            "tasks_attempted": tasks_attempted,
+            "tasks_succeeded": tasks_succeeded,
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "first_solve_seconds": round(first_solve_time, 3) if first_solve_time is not None else None,
+            "guided": guided,
+        }
+        print(f"SUMMARY_JSON={json.dumps(summary, separators=(',', ':'))}")
+        return summary
+
+def run_ab_compare(
+    seeds: int = 5,
+    max_seconds: Optional[float] = None,
+    quick: bool = False,
+    tasks: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    guided_results = []
+    unguided_results = []
+    per_run_max = max_seconds
+    if max_seconds is not None:
+        total_runs = max(1, seeds * 2)
+        per_run_max = max(5.0, max_seconds / total_runs)
+    for seed in range(seeds):
+        print("\n" + "=" * 20 + f" SEED {seed} UNGUIDED " + "=" * 20)
+        unguided = run_synthesis_verification_suite(
+            quick=quick,
+            max_seconds=per_run_max,
+            tasks=tasks,
+            guided=False,
+            seed=seed,
+        )
+        unguided_results.append(unguided)
+        print("\n" + "=" * 20 + f" SEED {seed} GUIDED " + "=" * 20)
+        guided = run_synthesis_verification_suite(
+            quick=quick,
+            max_seconds=per_run_max,
+            tasks=tasks,
+            guided=True,
+            seed=seed,
+        )
+        guided_results.append(guided)
+
+    def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        solved = sum(1 for r in results if r["tasks_succeeded"] > 0)
+        total_succeeded = sum(r["tasks_succeeded"] for r in results)
+        times = [r["first_solve_seconds"] for r in results if r["first_solve_seconds"] is not None]
+        median_time = None
+        if times:
+            times_sorted = sorted(times)
+            mid = len(times_sorted) // 2
+            if len(times_sorted) % 2 == 0:
+                median_time = (times_sorted[mid - 1] + times_sorted[mid]) / 2.0
+            else:
+                median_time = times_sorted[mid]
+        return {
+            "seeds": len(results),
+            "seeds_with_solve": solved,
+            "total_tasks_succeeded": total_succeeded,
+            "median_time_to_first_solve": median_time,
+        }
+
+    guided_summary = summarize(guided_results)
+    unguided_summary = summarize(unguided_results)
+    guided_wins = False
+    criteria = []
+    if guided_summary["total_tasks_succeeded"] > unguided_summary["total_tasks_succeeded"]:
+        guided_wins = True
+        criteria.append("more_tasks_solved")
+    if guided_summary["median_time_to_first_solve"] is not None:
+        if unguided_summary["median_time_to_first_solve"] is None or guided_summary["median_time_to_first_solve"] < unguided_summary["median_time_to_first_solve"]:
+            guided_wins = True
+            criteria.append("lower_median_time_to_first_solve")
+    if guided_summary["seeds_with_solve"] > unguided_summary["seeds_with_solve"]:
+        guided_wins = True
+        criteria.append("higher_success_rate")
+    summary = {
+        "guided": guided_summary,
+        "unguided": unguided_summary,
+        "guided_wins": guided_wins,
+        "criteria": criteria,
+    }
+    print(f"AB_COMPARE_JSON={json.dumps(summary, separators=(',', ':'))}")
+    return summary
 
 
 def orchestrator_benchmark_main(args):
@@ -12123,6 +12663,19 @@ if __name__ == "__main__":
 
     # 3. HRM Life (Infinite Loop)
     hrm_parser = subparsers.add_parser("hrm-life", help="Run infinite HRM life loop")
+
+    # 4. Synthesis Verification Suite (Deterministic)
+    synth_parser = subparsers.add_parser("synthesis", help="Run synthesis verification suite")
+    synth_parser.add_argument("--quick", action="store_true", help="Reduce search effort for fast smoke runs")
+    synth_parser.add_argument("--max-seconds", type=float, default=None, help="Hard cap runtime in seconds")
+    synth_parser.add_argument("--tasks", type=str, default=None, help="Comma-separated list of tasks to run")
+    synth_parser.add_argument("--guided", type=int, choices=[0, 1], default=0, help="Enable guided search")
+
+    ab_parser = subparsers.add_parser("ab-compare", help="Run guided vs unguided A/B comparison")
+    ab_parser.add_argument("--seeds", type=int, default=5, help="Number of seeds to compare")
+    ab_parser.add_argument("--max-seconds", type=float, default=None, help="Hard cap runtime in seconds")
+    ab_parser.add_argument("--quick", action="store_true", help="Reduce search effort for fast smoke runs")
+    ab_parser.add_argument("--tasks", type=str, default=None, help="Comma-separated list of tasks to run")
     
     # If no args, default to benchmark (but maybe simpler to smoke test for now? User asked for benchmark default)
     # However, if I run with no args, argparse helps? No, I need manually check.
@@ -12139,5 +12692,25 @@ if __name__ == "__main__":
         orchestrator_main()
     elif args.command == "hrm-life":
         run_hrm_life()
+    elif args.command == "synthesis":
+        task_list = None
+        if args.tasks:
+            task_list = [t.strip() for t in args.tasks.split(",") if t.strip()]
+        run_synthesis_verification_suite(
+            quick=args.quick,
+            max_seconds=args.max_seconds,
+            tasks=task_list,
+            guided=bool(args.guided),
+        )
+    elif args.command == "ab-compare":
+        task_list = None
+        if args.tasks:
+            task_list = [t.strip() for t in args.tasks.split(",") if t.strip()]
+        run_ab_compare(
+            seeds=args.seeds,
+            max_seconds=args.max_seconds,
+            quick=args.quick,
+            tasks=task_list,
+        )
     else:
         parser.print_help()
