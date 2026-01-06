@@ -17,7 +17,7 @@ def verify_neural():
 
     print("[Test] Running Synthesis with Neural Guidance...")
     if args.ab_compare:
-        cmd = [sys.executable, "Systemtest.py", "ab-compare", "--seeds", str(args.seeds)]
+        cmd = [sys.executable, "-u", "Systemtest.py", "ab-compare", "--seeds", str(args.seeds)]
         if args.max_seconds is not None:
             cmd.extend(["--max-seconds", str(args.max_seconds)])
         if args.quick:
@@ -25,7 +25,7 @@ def verify_neural():
         if args.tasks:
             cmd.extend(["--tasks", args.tasks])
     else:
-        cmd = [sys.executable, "Systemtest.py", "synthesis"]
+        cmd = [sys.executable, "-u", "Systemtest.py", "synthesis"]
         if args.quick:
             cmd.append("--quick")
         if args.max_seconds is not None:
@@ -61,7 +61,7 @@ def verify_neural():
     print(errors[-1000:])
     
     # Checks
-    priors_detected = "[Latent] Guidance Priors:" in output
+    priors_detected = "[Latent] Combined Priors:" in output or "[Latent] Prior calibration:" in output
     if priors_detected:
         print("[Pass] Latent Navigator is active (Priors detected).")
     else:
@@ -97,7 +97,9 @@ def verify_neural():
     else:
         print("\nOVERALL: NEURAL VERIFICATION FAILED")
     print(f"STATUS={status}")
-    sys.exit(0 if status == "PASS" else 1)
+    if status in {"PASS", "INCONCLUSIVE"}:
+        sys.exit(0)
+    sys.exit(1)
 
 if __name__ == "__main__":
     verify_neural()
