@@ -11553,6 +11553,75 @@ class BSRecCall(BSExpr):
 
 # Removed broken SafeInterpreter
 
+# ==============================================================================
+# FeedbackCollector - Collects synthesis attempt data for learning
+# ==============================================================================
+class FeedbackCollector:
+    """Collects feedback from synthesis attempts to improve future searches."""
+    
+    def __init__(self):
+        self.attempts = []  # List of (expr, success, depth, behavior_hash)
+        self.op_success_counts = {'+': 0, '-': 0, '*': 0, 'Rec': 0, 'Arg': 0, 'Const': 0}
+        self.op_total_counts = {'+': 0, '-': 0, '*': 0, 'Rec': 0, 'Arg': 0, 'Const': 0}
+        self.best_depth_reached = 0
+        self.promising_patterns = []  # Expressions with high partial match scores
+        
+    def record_attempt(self, expr: 'BSExpr', passes: int, total: int, depth: int):
+        """Record a synthesis attempt for learning."""
+        success_rate = passes / max(1, total)
+        atoms = self._extract_ops(expr)
+        
+        # Update operator counts
+        for atom in atoms:
+            if atom in self.op_total_counts:
+                self.op_total_counts[atom] += 1
+                if success_rate > 0.5:
+                    self.op_success_counts[atom] += 1
+        
+        # Track promising patterns (partial matches)
+        if success_rate > 0.3 and success_rate < 1.0:
+            self.promising_patterns.append((str(expr), success_rate, depth))
+            self.promising_patterns = self.promising_patterns[-50:]  # Keep last 50
+            
+        self.best_depth_reached = max(self.best_depth_reached, depth)
+        
+    def _extract_ops(self, expr: 'BSExpr') -> List[str]:
+        """Extract operator types from an expression."""
+        ops = []
+        if isinstance(expr, BSBinOp):
+            ops.append(expr.op)
+            ops.extend(self._extract_ops(expr.left))
+            ops.extend(self._extract_ops(expr.right))
+        elif isinstance(expr, BSRecCall):
+            ops.append('Rec')
+            ops.extend(self._extract_ops(expr.arg))
+        elif isinstance(expr, BSVar):
+            ops.append('Arg')
+        elif isinstance(expr, BSVal):
+            ops.append('Const')
+        return ops
+    
+    def get_learned_priors(self) -> Dict[str, float]:
+        """Generate priors based on observed success rates."""
+        priors = {}
+        for op in self.op_total_counts:
+            total = self.op_total_counts[op]
+            if total > 0:
+                success = self.op_success_counts[op]
+                # Bayesian-like update: prior = (success + 1) / (total + 2)
+                priors[op] = (success + 1) / (total + 2)
+            else:
+                priors[op] = 0.5  # Uninformative prior
+        return priors
+    
+    def get_insights(self) -> Dict[str, Any]:
+        """Return insights for debugging/logging."""
+        return {
+            "best_depth": self.best_depth_reached,
+            "promising_count": len(self.promising_patterns),
+            "learned_priors": self.get_learned_priors(),
+        }
+
 NAVIGATOR_ATOM_MAP = ["+", "-", "*", "Rec", "Arg", "Const"]
 
 class LatentNavigator(nn.Module if torch else object):
@@ -11591,20 +11660,7 @@ class LatentNavigator(nn.Module if torch else object):
          
          priors = {k: v for k, v in zip(NAVIGATOR_ATOM_MAP, probs)}
          
-         # SMART BOOST: Detect Fibonacci-like patterns (output > input, rapid growth)
-         if len(io_pairs) >= 3:
-             outputs = [p['output'] for p in io_pairs]
-             # Check for additive recurrence: out[i] ≈ out[i-1] + out[i-2]
-             is_fib_like = all(
-                 abs(outputs[i] - (outputs[i-1] + outputs[i-2])) < 0.01
-                 for i in range(2, len(outputs))
-             )
-             if is_fib_like:
-                 # Heavily boost Rec and + operators for Fibonacci
-                 priors['Rec'] = min(0.8, priors.get('Rec', 0.1) * 5)
-                 priors['+'] = min(0.6, priors.get('+', 0.1) * 3)
-                 priors['-'] = min(0.4, priors.get('-', 0.1) * 2)
-                 
+         # NOTE: Fibonacci detection removed - organic learning will handle pattern recognition
          return priors
 
     def learn(self, io_pairs: List[Dict[str, Any]], used_atoms: List[str]):
@@ -11839,6 +11895,7 @@ class BottomUpSynthesizer:
         self.guided = guided
         self.interpreter = SafeInterpreter(limit=2000)
         self.navigator = LatentNavigator()
+        self.feedback = FeedbackCollector()  # NEW: Organic feedback loop
         self.latent_priors_detected = False
         self.replay = ReplayBuffer(capacity=replay_capacity)
         self.training_every = 200
@@ -11849,6 +11906,7 @@ class BottomUpSynthesizer:
         self.model: Optional[PolicyModel] = None
         self.step_count = 0
         self.last_improvement_step = 0
+        self.reward_stats = {"min": 0.0, "max": 0.0, "mean": 0.0, "count": 0}
         self.reward_stats = {"min": 0.0, "max": 0.0, "mean": 0.0, "count": 0}
 
     def _score_expr(self, expr: BSExpr, priors: Dict[str, float]) -> float:
@@ -11993,11 +12051,21 @@ class BottomUpSynthesizer:
                     code = self._to_python(expr, base_k, base_v)
                     return [(code, expr, base_k, base_v)]
 
-        # Latent Space Guidance
+        # Latent Space Guidance + Organic Learned Priors
         priors = self.navigator.get_priors(active_io) if self.navigator else {}
+        learned_priors = self.feedback.get_learned_priors()
+        
+        # ORGANIC: Combine Navigator priors with learned experience priors
+        if learned_priors and sum(self.feedback.op_total_counts.values()) > 100:
+            # Blend: 70% Navigator + 30% Learned (after sufficient experience)
+            for k in priors:
+                if k in learned_priors:
+                    priors[k] = 0.7 * priors[k] + 0.3 * learned_priors[k]
+            print(f"    [Organic] Blending learned priors: { {k: round(v,3) for k,v in learned_priors.items()} }")
+        
         if priors:
             self.latent_priors_detected = True
-            print(f"    [Latent] Guidance Priors: { {k: round(v,3) for k,v in priors.items()} }")
+            print(f"    [Latent] Combined Priors: { {k: round(v,3) for k,v in priors.items()} }")
 
         print(f"    [Synthesizer] Growing atoms for {len(active_io)} inputs (Base: n<={base_k}->{base_v})...")
 
@@ -12104,6 +12172,10 @@ class BottomUpSynthesizer:
                 if valid:
                     error_mean = error_sum / max(1, len(active_io) - passes)
                     sig_tuple = tuple(sig)
+                    
+                    # ORGANIC FEEDBACK: Record this attempt for learning
+                    self.feedback.record_attempt(expr, passes, len(active_io), depth)
+                    
                     # Unique check
                     # FIX: Do not prune BSRecCall against non-recursive items. 
                     # They are structurally distinct and crucial for future compositions.
