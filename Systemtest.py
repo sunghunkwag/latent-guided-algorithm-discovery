@@ -11830,7 +11830,11 @@ class SafeInterpreter:
                 raise RuntimeError("Non-terminating recursion (arg >= n)")
                 
             # 3. Recursive Invocation (Base Check + Execution)
-            if arg_val <= k: return v
+            if arg_val <= k: 
+                # IDENTITY BASE CASE CHECK: If v is sentinel -9999, return n (arg_val)
+                if v == -9999:
+                    return arg_val
+                return v
             return self._execute(root_body, arg_val, k, v, ctx, root_body)
             
         return 0
@@ -12133,11 +12137,28 @@ class BottomUpSynthesizer:
         base_k = 1
         base_v = 1
         sorted_io = sorted(io_pairs, key=lambda x: x['input'])
+        
         if sorted_io and sorted_io[0]['input'] <= 1:
             base_k = sorted_io[0]['input']
             base_v = sorted_io[0]['output']
-            if len(sorted_io) > 1 and sorted_io[1]['input'] == base_k + 1 and sorted_io[1]['output'] == base_v:
-                base_k = sorted_io[1]['input']
+            
+            # Check for Identity Base Case (y = x)
+            # This is critical for Fibonacci (0->0, 1->1) where "return n" is needed
+            is_identity = (sorted_io[0]['input'] == sorted_io[0]['output'])
+            if is_identity:
+                # Check 2nd item if exists
+                if len(sorted_io) > 1 and sorted_io[1]['input'] == base_k + 1:
+                    if sorted_io[1]['input'] == sorted_io[1]['output']:
+                        base_k = sorted_io[1]['input'] # Extend base_k to 1
+                        base_v = -9999 # Sentinel for "return n"
+                    elif sorted_io[1]['output'] == base_v: # Constant match
+                        base_k = sorted_io[1]['input']
+                else: 
+                     base_v = -9999 # Single item identity match
+            else:
+                 # Standard Constant check
+                 if len(sorted_io) > 1 and sorted_io[1]['input'] == base_k + 1 and sorted_io[1]['output'] == base_v:
+                    base_k = sorted_io[1]['input']
 
         active_io = [p for p in io_pairs if p['input'] > base_k]
         if not active_io: return []
@@ -12410,7 +12431,8 @@ class BottomUpSynthesizer:
 
 
     def _to_python(self, expr: BSExpr, k: int, v: int) -> str:
-        return f"def f(n):\n    if n <= {k}: return {v}\n    return {expr}"
+        base_stmt = f"return {v}" if v != -9999 else "return n"
+        return f"def f(n):\n    if n <= {k}: {base_stmt}\n    return {expr}"
 
 
 class HRMSidecar:
