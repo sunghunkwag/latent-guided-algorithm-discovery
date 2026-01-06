@@ -11589,7 +11589,23 @@ class LatentNavigator(nn.Module if torch else object):
          with torch.no_grad():
              probs = self(xt)[0].tolist()
          
-         return {k: v for k, v in zip(NAVIGATOR_ATOM_MAP, probs)}
+         priors = {k: v for k, v in zip(NAVIGATOR_ATOM_MAP, probs)}
+         
+         # SMART BOOST: Detect Fibonacci-like patterns (output > input, rapid growth)
+         if len(io_pairs) >= 3:
+             outputs = [p['output'] for p in io_pairs]
+             # Check for additive recurrence: out[i] ≈ out[i-1] + out[i-2]
+             is_fib_like = all(
+                 abs(outputs[i] - (outputs[i-1] + outputs[i-2])) < 0.01
+                 for i in range(2, len(outputs))
+             )
+             if is_fib_like:
+                 # Heavily boost Rec and + operators for Fibonacci
+                 priors['Rec'] = min(0.8, priors.get('Rec', 0.1) * 5)
+                 priors['+'] = min(0.6, priors.get('+', 0.1) * 3)
+                 priors['-'] = min(0.4, priors.get('-', 0.1) * 2)
+                 
+         return priors
 
     def learn(self, io_pairs: List[Dict[str, Any]], used_atoms: List[str]):
          if not self.active: return
@@ -11811,9 +11827,9 @@ class PolicyModel:
 class BottomUpSynthesizer:
     def __init__(
         self,
-        max_depth=6,
-        max_candidates=50000,
-        bank_cap=600,
+        max_depth=8,
+        max_candidates=80000,
+        bank_cap=2000,
         guided: bool = False,
         replay_capacity: int = 50000,
     ):
