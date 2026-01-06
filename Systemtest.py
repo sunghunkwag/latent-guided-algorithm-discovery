@@ -12602,13 +12602,17 @@ def orchestrator_main():
             
             # HRM Sidecar Call
             if is_stagnant:
-                # Capture experiences (mocking extraction from skills/mem for now)
-                # In real usage, this would be: exps = [s.to_python() for s in orch.skills.list()]
-                # Here we simulate with previously seen 'tasks' or just successful snippets
+                # Capture REAL experiences from memory and skills
                 experiences = []
-                recent_mems = orch.mem.search("success", k=5) # Naively search for success
-                # Since mem content is structured, we synthesize strings for verifying the flow
-                experiences = ["return x + 1", "return y + 5"] # Mock to ensure Stitch triggers
+                recent_mems = orch.mem.search("success", k=5)
+                for mem in recent_mems:
+                    if hasattr(mem, 'content') and mem.content:
+                        experiences.append(str(mem.content))
+                # Also check skill library
+                if hasattr(orch, 'skills') and orch.skills:
+                    for skill in orch.skills.list()[:5]:
+                        if hasattr(skill, 'to_python'):
+                            experiences.append(skill.to_python())
                 
                 concepts = hrm_sidecar.dream(experiences)
                 hrm_sidecar.inject(concepts)
